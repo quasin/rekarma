@@ -1,2 +1,3 @@
-# rekarma
+# ReKarma
+
 ReKarma - distributed recommendation system
