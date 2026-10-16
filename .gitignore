@@ -1,3 +1,10 @@
 !.gitignore
 .zig-cache/
 zig-out/
+
+# vendor/librats/ is generated, never committed: scripts/fetch-librats.sh
+# downloads the prebuilt release (6 MB librats.a + upstream headers) into it, and
+# install.sh calls that script. Run it once after a clone, before `zig build`.
+# The hand-written librats/util/features.h the release omits lives in
+# scripts/librats/features.h (tracked) and is copied in by the same script.
+/vendor/
