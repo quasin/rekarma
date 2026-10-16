@@ -1,0 +1,15 @@
+.{
+    .name = .rekarma,
+    .version = "0.0.0",
+    .fingerprint = 0x6e49aeb55bbd4bd6,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
