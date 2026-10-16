@@ -65,6 +65,18 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // The room log is pure Zig — no librats, no C module — so its unit tests need
+    // nothing but the compiler and run in a watertight module of their own.
+    const log_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/room_log.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&b.addRunArtifact(log_tests).step);
+
     const run_step = b.step("run", "Run the app");
 
     const run_cmd = b.addRunArtifact(exe);

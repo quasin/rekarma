@@ -2,12 +2,15 @@
 
 Distributed recommendation system. Zig 0.17.0 executable that links the
 prebuilt librats (C++ p2p/DHT/bittorrent) release; Autonomi `ant-client` is
-installed by `install.sh` for later use. Today `main.zig` only prints a banner
-and reads the librats version out of the linked library.
+installed by `install.sh` for later use. `main.zig` joins one librats pubsub
+room and records the last messages it carries into that room's file
+(`all.txt` by default), and can publish a message handed to it on the command
+line.
 
 ## Layout
 
-    src/main.zig                  executable entry point (root of the `rekarma` exe)
+    src/main.zig                  executable entry point: args, node, room loop
+    src/room_log.zig              the room's file — last N messages, in memory and on disk
     src/c.h                       every C #include the project needs, in one header
     build.zig                     librats guard, translate-c module, runtime linking
     build.zig.zon                 package manifest (min zig 0.17.0; .paths = tracked paths only)
@@ -20,13 +23,58 @@ and reads the librats version out of the linked library.
 ## Commands
 
     zig build                                 # link the exe -> zig-out/bin/rekarma
-    zig build run                             # build + run
+    zig build run                             # build + run a node (blocks until Ctrl-C)
     zig build run -- <args>                   # pass args (run_cmd.addPassthruArgs)
+    zig build test                            # unit tests (src/room_log.zig only)
     zig build -Dlibstdcpp=/path -Dlibgcc_s=/path   # override system C++ runtime paths
     bash install.sh                           # ant-client + fetch librats (first setup)
     bash scripts/fetch-librats.sh             # (re)fetch librats after a clone or to bump
 
-There is no test step wired in `build.zig` yet.
+`zig build run` starts a real node: it joins the room, listens on the network and
+stays up until SIGINT/SIGTERM. Add `-- --help` for the option list, `-- --show`
+to print the room's file and exit without starting anything.
+
+## The room and its file
+
+- One room (`rekarma`) and one file (`all.txt`, in the cwd) for everyone by
+  default; `--room` / `--file` / `--count` change them. `{room}` in `--file` is
+  replaced by the room name, so one file per room needs no wrapper script.
+- A message on the command line is published into the room after a short wait
+  for a peer, and the node keeps listening afterwards.
+- Each line is `<utc stamp> <peer id prefix> <message>`, appended by rewriting
+  the file from the in-memory window — that is the only way the cap can drop the
+  oldest line.
+- The pubsub callback runs on a librats reactor thread and only formats and
+  queues; the file is written by the main loop.
+- Discovery (DHT + mDNS + peer exchange) is on by default, and its DHT key is
+  the room name, so nodes only find others in the same room. `--no-discovery`
+  plus `--connect host:port` is how a run is wired by hand.
+- NAT traversal is on by default (`--no-nat` disables it): UPnP/NAT-PMP port
+  mapping for the listen port and hole punching with rendezvous serving. It is
+  what makes a DHT-discovered peer reachable at all; without it the DHT finds
+  addresses nothing can dial. `--serve-relay` additionally carries other peers'
+  connections, which is the only way two carrier-grade-NAT'd nodes ever meet.
+
+## Discovery: mDNS works where the DHT cannot
+
+Both are on by default and they answer different questions — do not read "no
+messages over the DHT" as a code bug until this has been ruled out:
+
+- mDNS advertises the *LAN* address, so two nodes on one network connect with no
+  NAT in the path. This is why a two-terminals-on-one-laptop test always passes
+  on mDNS and never on the DHT.
+- The DHT advertises whatever public address the mesh reports for us. Dialing it
+  goes out through the router and back, which only works on a router with NAT
+  loopback, and only reaches us at all if the address is really ours — behind
+  double NAT/carrier-grade NAT the router's WAN IP (what UPnP reports) and the
+  real egress IP (what STUN and the DHT report) differ, and neither is reachable
+  inbound.
+- `rats_on_dial_failed` is registered, so a discovered-but-unreachable peer is
+  printed as `no route to <addr>` instead of silence. That line is the signal:
+  discovery and NAT are working, reachability is not.
+
+Debug a layer at a time with `--no-mdns` / `--no-dht` / `--no-discovery`, and
+give a sender `--wait` if the DHT needs longer than its default 90 s.
 
 ## Hard constraints
 
@@ -60,4 +108,10 @@ There is no test step wired in `build.zig` yet.
 ## Validate a change
 
     zig build            # must exit 0
-    zig build run        # prints the banner + the linked librats version/abi
+    zig build test       # unit tests: the room file keeps only its last N lines
+    zig build run -- --help    # prints the banner, the linked librats version/abi and the options
+
+`zig build run` alone starts a node and never returns on its own — give it
+`--show`, `--help` or a `--connect` peer, or stop it with Ctrl-C. librats' own
+INFO logs go to stdout as well, so the default log level is WARN and `-v` is
+what turns them visibly on.

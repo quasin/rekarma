@@ -47,3 +47,35 @@ source.
 ### Build
 
     zig build run
+
+### The room
+
+The program joins one librats pubsub room and records the last messages the room
+carries in that room's file — `all.txt`, 1000 messages, room `rekarma`, all three
+changeable:
+
+    rekarma                          record the default room into all.txt
+    rekarma "hello peers"            publish into the room, then keep recording
+    rekarma -r news -f "logs/{room}.txt" -n 50
+    rekarma --show                   print all.txt's last 1000 messages and exit
+    rekarma --help                   every option
+
+Nodes find each other through the DHT keyed by the room name (plus mDNS on one
+local network); `--no-discovery --connect host:port` wires two of them by hand.
+A run stays up until Ctrl-C.
+
+NAT traversal is on by default: the node asks the router for its port over
+UPnP/NAT-PMP and allows hole punching, because a DHT-discovered peer is only
+reachable if its advertised address is. When a discovered peer cannot be dialed,
+the node says so (`no route to <addr>`) rather than staying silent.
+
+Two caveats worth knowing before blaming the DHT:
+
+- Two nodes on one machine (or one LAN) meet over mDNS, never over the DHT: the
+  DHT advertises the public address, and a dial to it has to come back through
+  the router, which most routers only allow if the address is really ours.
+- Behind double NAT / carrier-grade NAT nothing inbound can reach the advertised
+  address at all. Use `--serve-relay` on some node so the others can route
+  through it, or `--connect` to wire the two ends directly.
+
+`--no-mdns`, `--no-dht` and `--no-nat` isolate one layer at a time.
