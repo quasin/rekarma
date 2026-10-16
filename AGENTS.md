@@ -4,8 +4,8 @@ Distributed recommendation system. Zig 0.17.0 executable that links the
 prebuilt librats (C++ p2p/DHT/bittorrent) release; Autonomi `ant-client` is
 installed by `install.sh` for later use. `main.zig` joins one librats pubsub
 room and records the last messages it carries into that room's file
-(`all.txt` by default), and can publish a message handed to it on the command
-line.
+(`all.txt` by default), can publish a message handed to it on the command
+line, and can run itself as a daemon recording the room in the background.
 
 ## Layout
 
@@ -32,15 +32,29 @@ line.
 
 `zig build run` starts a real node: it joins the room, listens on the network and
 stays up until SIGINT/SIGTERM. Add `-- --help` for the option list, `-- --show`
-to print the room's file and exit without starting anything.
+to print the room's file and exit without starting anything, `-- --daemon` to
+start the same node in the background, and `-- "message"` to send one and exit.
 
 ## The room and its file
 
 - One room (`rekarma`) and one file (`all.txt`, in the cwd) for everyone by
   default; `--room` / `--file` / `--count` change them. `{room}` in `--file` is
   replaced by the room name, so one file per room needs no wrapper script.
-- A message on the command line is published into the room after a short wait
-  for a peer, and the node keeps listening afterwards.
+- A message on the command line is a one-shot send: published after a short wait
+  for a peer, then the process exits once the reactor has had a moment to put it
+  on the wire. `--stay` records afterwards instead, as the program always used
+  to. A send never opens the room's file — `load()` rewrites what it is given,
+  and a sender that created or trimmed a recorder's log would be a surprise
+  (`--file`/`--count` are the recorder's options).
+- `rekarma --daemon` is the recording node in the background: one fork plus
+  `setsid()` (its own session, so a closing terminal no longer sends it SIGHUP),
+  stdout and stderr appended to `<file>.log`, its pid in `<file>.pid`, and
+  `kill $(cat <file>.pid)` leaves through the same SIGTERM path as Ctrl-C.
+  `--log` / `--pid` move the two files; the cwd is kept, because the room's file
+  is resolved against it. The fork happens before `rats_create()` and nowhere
+  else: after that call the reactor threads a fork drops are the node's.
+- A bare `daemon` word stays what it always was, a message: the mode is the
+  `--daemon` flag only, so no room loses the word to the option parser.
 - Each line is `<utc stamp> <peer id prefix> <message>`, appended by rewriting
   the file from the in-memory window — that is the only way the cap can drop the
   oldest line.
@@ -110,8 +124,20 @@ give a sender `--wait` if the DHT needs longer than its default 90 s.
     zig build            # must exit 0
     zig build test       # unit tests: the room file keeps only its last N lines
     zig build run -- --help    # prints the banner, the linked librats version/abi and the options
+    zig build run -- --no-discovery -w 1 "smoke"   # a send that exits on its own in ~1 s
+    zig build run -- --daemon -f /tmp/rekarma-smoke.txt && kill $(cat /tmp/rekarma-smoke.txt.pid)   # forks, prints its pid, returns at once
 
 `zig build run` alone starts a node and never returns on its own — give it
-`--show`, `--help` or a `--connect` peer, or stop it with Ctrl-C. librats' own
-INFO logs go to stdout as well, so the default log level is WARN and `-v` is
+`--show`, `--help`, `--connect` or a message, or stop it with Ctrl-C. librats'
+own INFO logs go to stdout as well, so the default log level is WARN and `-v` is
 what turns them visibly on.
+
+Two nodes on one host are wired by hand, because discovery depends on the network
+(a public-IP host with no multicast sees no mDNS peer, and the DHT round is 40 s):
+
+    rekarma --daemon -r smoke -f /tmp/rec.txt --no-discovery -p 45001   # recorder
+    rekarma "hello" -r smoke --no-discovery -c 127.0.0.1:45001          # sender, exits
+    cat /tmp/rec.txt                                                    # the line is there
+
+Stop the daemon with `kill $(cat /tmp/rec.txt.pid)` and its log is
+`/tmp/rec.txt.log`.

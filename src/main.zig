@@ -20,6 +20,13 @@ const protocol = "rekarma/1.0";
 const publish_wait_with_dht: u32 = 90;
 const publish_wait_without_dht: u32 = 5;
 
+/// How long a one-shot send (a message on the command line) keeps the node up
+/// after rats_publish() returns. The call only hands the bytes to a librats
+/// reactor thread, so exiting in the same breath would cut that write off before
+/// it reached the wire. A peer on localhost happens to receive the message with
+/// no delay at all, which is why this is margin and not a measured lower bound.
+const send_drain_ms: u32 = 1000;
+
 /// SIGINT/SIGTERM land here. It is atomic because the handler runs on whichever
 /// thread the kernel picked; only the main loop reads it.
 var stop = std.atomic.Value(bool).init(false);
@@ -59,13 +66,30 @@ fn run(init: std.process.Init) !void {
     }
 
     const log_path = try roomFilePath(arena, opts.file, opts.room);
-    var log = try room_log.RoomLog.init(gpa, log_path, opts.count);
-    defer log.deinit();
-    log.load(io) catch |err| {
-        try out.print("rekarma: cannot open the room's log {s}: {s}\n", .{ log_path, @errorName(err) });
-        try out.flush();
-        std.process.exit(1);
-    };
+
+    // Detached first, before anything else a node does: the fork inside is only
+    // safe while this process is still one thread.
+    if (opts.daemon) try daemonize(arena, io, out, log_path, opts);
+
+    // A message on the command line is a one-shot send: publishing is the whole
+    // job, so the room's file is never opened — load() rewrites the file it is
+    // given, and a sender that creates or trims the recorder's log is a side
+    // effect nobody asked for. --stay is the behaviour of sending and then
+    // recording, the daemon is the node that records and nothing else.
+    const send_only = opts.message.items.len != 0 and !opts.daemon and !opts.stay and !opts.show;
+
+    var log: room_log.RoomLog = undefined;
+    if (!send_only) {
+        log = try room_log.RoomLog.init(gpa, log_path, opts.count);
+        log.load(io) catch |err| {
+            try out.print("rekarma: cannot open the room's log {s}: {s}\n", .{ log_path, @errorName(err) });
+            try out.flush();
+            std.process.exit(1);
+        };
+    }
+    defer {
+        if (!send_only) log.deinit();
+    }
 
     // --show is a pure reader: it prints what a later run would work with.
     if (opts.show) {
@@ -162,7 +186,13 @@ fn run(init: std.process.Init) !void {
     }
 
     try out.print("room     {s}\n", .{opts.room});
-    try out.print("log      {s} (last {d} messages)\n", .{ log_path, opts.count });
+    // A sender never opens the file, and naming one would suggest it recorded
+    // something: what it publishes is in the room, not in a file here.
+    if (send_only) {
+        try out.print("log      none (a send only publishes; --stay records)\n", .{});
+    } else {
+        try out.print("log      {s} (last {d} messages)\n", .{ log_path, opts.count });
+    }
     try out.print("node     {s} on port {d}\n", .{
         std.mem.span(c.rats_local_id(node)), c.rats_listen_port(node),
     });
@@ -185,6 +215,13 @@ fn run(init: std.process.Init) !void {
         const wait = opts.wait_seconds orelse
             if (use_dht) publish_wait_with_dht else publish_wait_without_dht;
         try publish(io, node, room_z, text, wait, out);
+
+        // A send is over when the message is out: drain the reactor, then exit
+        // through the same unwind a stopped node takes (rats_destroy() first).
+        if (send_only) {
+            Io.sleep(io, .fromMilliseconds(send_drain_ms), .awake) catch {};
+            return;
+        }
     }
 
     try out.print("listening in {s} — Ctrl-C to stop\n", .{opts.room});
@@ -246,6 +283,92 @@ fn publish(io: Io, node: c.rats_t, room_z: [:0]const u8, text: []const u8, wait_
     }
     try check(out, c.rats_publish(node, room_z.ptr, text.ptr, text.len), "publish");
     try out.print("published to {s}: {s}\n", .{ room_z, text });
+    try out.flush();
+}
+
+/// `rekarma --daemon`: the recording node, started in the background.
+///
+/// The parent reports where the daemon went and leaves; the child detaches from
+/// the terminal, points its standard streams at a log file and records the room
+/// until it is signalled. Nothing here forks a second time: one fork plus
+/// setsid() is a session with no controlling terminal, which is all a daemon
+/// needs (a closing terminal no longer sends it SIGHUP).
+fn daemonize(arena: std.mem.Allocator, io: Io, out: *Io.Writer, log_path: []const u8, opts: Options) !void {
+    // A daemon prints where nobody is looking, so its output needs a file; both
+    // it and the pid file default to sitting next to the room's own log, which
+    // makes one run leave one recognizable set of files.
+    const log_file = if (opts.log) |template|
+        try roomFilePath(arena, template, opts.room)
+    else
+        try std.fmt.allocPrint(arena, "{s}.log", .{log_path});
+    const pid_file = if (opts.pid) |template|
+        try roomFilePath(arena, template, opts.room)
+    else
+        try std.fmt.allocPrint(arena, "{s}.pid", .{log_path});
+
+    const log_z = try arena.dupeSentinel(u8, log_file, 0);
+
+    // fork() is safe exactly here and nowhere later: no librats node exists yet,
+    // so this is still the one thread the child inherits — after rats_create()
+    // the reactor threads a fork drops would be the node's.
+    const child = std.c.fork();
+    if (child < 0) {
+        try out.print("rekarma: fork failed, the daemon was not started\n", .{});
+        try out.flush();
+        std.process.exit(1);
+    }
+    if (child > 0) {
+        // The parent has nothing left to do but say where the daemon went. _exit
+        // and not exit: the child owns a copy of this memory now, and this
+        // process must not run the IO teardown of a run it is no longer part of.
+        try out.print("rekarma: daemon started, pid {d}\n", .{child});
+        try out.print("         log      {s}\n", .{log_file});
+        try out.print("         pid file {s}\n", .{pid_file});
+        try out.print("         stop     kill $(cat {s})\n", .{pid_file});
+        try out.flush();
+        std.c._exit(0);
+    }
+
+    // The fork left the child in the shell's process group and therefore not a
+    // group leader, which is the condition setsid() needs to succeed.
+    _ = std.c.setsid();
+
+    // Append, and only append: a restarted daemon continues the log of the run
+    // that ended instead of erasing the failure that ended it.
+    const flags: std.c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true };
+    const log_fd = std.c.open(log_z.ptr, flags, @as(std.c.mode_t, 0o644));
+    if (log_fd < 0) {
+        try out.print("rekarma: cannot write the daemon's log {s}\n", .{log_file});
+        try out.flush();
+        std.process.exit(1);
+    }
+    // stdout *and* stderr: librats' own errors go to stderr, and a daemon that
+    // dropped them would have nowhere at all to report a failure.
+    _ = std.c.dup2(log_fd, 1);
+    _ = std.c.dup2(log_fd, 2);
+    if (log_fd > 2) _ = std.c.close(log_fd);
+
+    // Nothing ever reads a detached process's stdin, and a terminal that is gone
+    // is not a useful thing for it to hold open.
+    const dev_null = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY });
+    if (dev_null >= 0) {
+        _ = std.c.dup2(dev_null, 0);
+        if (dev_null > 2) _ = std.c.close(dev_null);
+    }
+
+    // The daemon writes its own pid: it is the only process that knows the pid it
+    // kept, and that file is how it is found again for a kill. The parent has
+    // already printed the same number, so an unwritable file is not fatal.
+    const pid = std.c.getpid();
+    var pid_buf: [32]u8 = undefined;
+    const pid_text = std.fmt.bufPrint(&pid_buf, "{d}\n", .{pid}) catch unreachable;
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = pid_file, .data = pid_text }) catch |err| {
+        try out.print("rekarma: cannot write the pid file {s}: {s}\n", .{ pid_file, @errorName(err) });
+    };
+
+    // The first line of the log: what pid this run kept, and where its output is
+    // — the parent says the same to the terminal it was started from.
+    try out.print("daemon   pid {d}, log {s}\n", .{ pid, log_file });
     try out.flush();
 }
 
@@ -424,6 +547,20 @@ fn parseArgs(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
             opts.verbose = true;
         } else if (std.mem.eql(u8, name, "--show")) {
             opts.show = true;
+        } else if (std.mem.eql(u8, name, "--daemon")) {
+            opts.daemon = true;
+        } else if (std.mem.eql(u8, name, "--stay")) {
+            opts.stay = true;
+        } else if (std.mem.eql(u8, name, "--log")) {
+            opts.log = reader.value(attached) orelse {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} needs a file name", .{name});
+                break :parse;
+            };
+        } else if (std.mem.eql(u8, name, "--pid")) {
+            opts.pid = reader.value(attached) orelse {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} needs a file name", .{name});
+                break :parse;
+            };
         } else if (std.mem.eql(u8, name, "--no-discovery")) {
             opts.discovery = false;
         } else if (std.mem.eql(u8, name, "--no-dht")) {
@@ -504,6 +641,14 @@ fn parseArgs(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
         // would take it as a topic.
         if (opts.room.len == 0) opts.problem = "the room name cannot be empty";
         if (opts.file.len == 0) opts.problem = "the file name cannot be empty";
+        // --daemon records and stays up: a message given with it would never be
+        // published, and --show prints and returns, which is the opposite.
+        if (opts.daemon and opts.message.items.len != 0) {
+            opts.problem = "--daemon records the room; a message given with it would never be published";
+        }
+        if (opts.daemon and opts.show) {
+            opts.problem = "--daemon and --show ask for opposite things: one stays up, the other prints and exits";
+        }
     }
 
     return opts;
@@ -571,6 +716,17 @@ const Options = struct {
     verbose: bool = false,
     show: bool = false,
     help: bool = false,
+    /// Record in the background: fork into a session of its own and put the
+    /// standard streams in a log file.
+    daemon: bool = false,
+    /// Keep recording after publishing a command-line message instead of exiting
+    /// once it is out.
+    stay: bool = false,
+    /// Where a daemon's stdout/stderr go; null = next to the room's file. {room}
+    /// is replaced by the room name, as in --file.
+    log: ?[]const u8 = null,
+    /// Where a daemon records its pid; null = next to the room's file.
+    pid: ?[]const u8 = null,
     /// Set instead of the options when the command line does not parse.
     problem: ?[]const u8 = null,
 };
@@ -580,12 +736,16 @@ fn printUsage(out: *Io.Writer) !void {
         \\ReKarma - distributed recommendation system
         \\
         \\Joins one pubsub room over librats and records the last messages it
-        \\carries in that room's file. Runs until SIGINT/SIGTERM.
+        \\carries in that room's file.
         \\
         \\Usage: rekarma [options] [message]
         \\
         \\A message on the command line is published into the room (after waiting
-        \\briefly for a peer), and the node keeps listening and recording as usual.
+        \\briefly for a peer) and the program exits once it is out; --stay keeps
+        \\recording afterwards, as it used to.
+        \\
+        \\--daemon records the room in the background until it is signalled:
+        \\  kill $(cat <pid file>)
         \\
         \\Options:
         \\  -r, --room <name>      pubsub room to join            [{s}]
@@ -596,6 +756,10 @@ fn printUsage(out: *Io.Writer) !void {
         \\  -d, --data-dir <dir>   identity and state directory    [none]
         \\  -c, --connect <h:p>    dial a peer, repeatable         [none]
         \\  -w, --wait <sec>       wait for a peer before publishing [90, or 5 without dht]
+        \\      --daemon           record in the background, detached from this terminal
+        \\      --stay             keep recording after publishing, do not exit
+        \\      --log <path>       daemon's stdout and stderr       [<file>.log]
+        \\      --pid <path>       daemon's pid file                [<file>.pid]
         \\      --no-discovery     no DHT, mDNS or peer exchange, only --connect
         \\      --no-dht           no DHT announce/search
         \\      --no-mdns          no local-network discovery
@@ -607,9 +771,11 @@ fn printUsage(out: *Io.Writer) !void {
         \\  -h, --help             this help
         \\
         \\Examples:
-        \\  rekarma                          record the default room into all.txt
-        \\  rekarma "hello peers"            publish to the default room
-        \\  rekarma -r news -f "logs/{{room}}.txt" -n 50
+        \\  rekarma                          record the default room in the foreground
+        \\  rekarma "hello peers"            publish to the room, then exit
+        \\  rekarma --stay "hello peers"     publish, then keep recording
+        \\  rekarma --daemon                 record the default room in the background
+        \\  rekarma --daemon -r news -f "logs/{{room}}.txt" -n 50
         \\  rekarma --show                   print all.txt's last 1000 messages
         \\
     , .{ default_room, default_file, default_count });

@@ -3,8 +3,11 @@
 zig-out/
 
 # Runtime output, not source: the default room log a plain `rekarma` run writes
-# into the cwd (--file puts it anywhere else).
+# into the cwd (--file puts it anywhere else), and the two files `rekarma --daemon`
+# keeps next to it — its own output and its pid.
 /all.txt
+/all.txt.log
+/all.txt.pid
 
 # vendor/librats/ is generated, never committed: scripts/fetch-librats.sh
 # downloads the prebuilt release (6 MB librats.a + upstream headers) into it, and

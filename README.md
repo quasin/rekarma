@@ -54,15 +54,42 @@ The program joins one librats pubsub room and records the last messages the room
 carries in that room's file — `all.txt`, 1000 messages, room `rekarma`, all three
 changeable:
 
-    rekarma                          record the default room into all.txt
-    rekarma "hello peers"            publish into the room, then keep recording
+    rekarma                          record the default room in the foreground
+    rekarma "hello peers"            publish into the room, then exit
+    rekarma --stay "hello peers"     publish, then keep recording
     rekarma -r news -f "logs/{room}.txt" -n 50
     rekarma --show                   print all.txt's last 1000 messages and exit
     rekarma --help                   every option
 
+A message on the command line is a one-shot send: the node waits briefly for
+somebody to be in the room, publishes, and exits once the message is out — a
+sender neither creates nor trims the room's file. `--stay` keeps recording after
+publishing instead.
+
+### The daemon
+
+`rekarma --daemon` is the recording node, detached:
+
+    rekarma --daemon                 record the default room in all.txt, in the background
+    rekarma --daemon -r news -f "logs/{room}.txt" -n 50
+    kill $(cat all.txt.pid)          stop it (SIGTERM, the same path as Ctrl-C)
+
+It forks into a session of its own — so it keeps running when the terminal that
+started it closes — and its stdout and stderr are appended to a log file, since
+a detached process has nowhere else to print its banner, its notices and
+librats' own errors:
+
+    all.txt          the room's messages (--file)
+    all.txt.log      the daemon's own output (--log)
+    all.txt.pid      its pid (--pid)
+
+Both default to sitting next to the room's file; `--log` and `--pid` name them
+explicitly, and `{room}` is replaced by the room name in them as it is in
+`--file`.
+
 Nodes find each other through the DHT keyed by the room name (plus mDNS on one
 local network); `--no-discovery --connect host:port` wires two of them by hand.
-A run stays up until Ctrl-C.
+A foreground run stays up until Ctrl-C.
 
 NAT traversal is on by default: the node asks the router for its port over
 UPnP/NAT-PMP and allows hole punching, because a DHT-discovered peer is only
