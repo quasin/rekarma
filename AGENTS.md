@@ -33,7 +33,8 @@ line, and can run itself as a daemon recording the room in the background.
 `zig build run` starts a real node: it joins the room, listens on the network and
 stays up until SIGINT/SIGTERM. Add `-- --help` for the option list, `-- --show`
 to print the room's file and exit without starting anything, `-- --daemon` to
-start the same node in the background, and `-- "message"` to send one and exit.
+start the same node in the background, `-- --version` to print which build this
+is without starting anything at all, and `-- "message"` to send one and exit.
 
 ## The room and its file
 
@@ -124,6 +125,7 @@ give a sender `--wait` if the DHT needs longer than its default 90 s.
     zig build            # must exit 0
     zig build test       # unit tests: the room file keeps only its last N lines
     zig build run -- --help    # prints the banner, the linked librats version/abi and the options
+    zig build run -- --version # rekarma's version (from build.zig.zon) and the linked librats'
     zig build run -- --no-discovery -w 1 "smoke"   # a send that exits on its own in ~1 s
     zig build run -- --daemon -f /tmp/rekarma-smoke.txt && kill $(cat /tmp/rekarma-smoke.txt.pid)   # forks, prints its pid, returns at once
 

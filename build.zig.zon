@@ -1,6 +1,6 @@
 .{
     .name = .rekarma,
-    .version = "0.0.0",
+    .version = "0.0.1",
     .fingerprint = 0x6e49aeb55bbd4bd6,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{

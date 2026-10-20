@@ -53,6 +53,35 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("c", translate_c.createModule());
 
+    // The version the binary reports (--version, the banner) is the one
+    // build.zig.zon declares: injecting it here keeps a single place to bump
+    // instead of a constant in src/ that drifts from the manifest. There is no
+    // accessor for the root manifest, so it is read and parsed; the fields this
+    // binary does not need (name, fingerprint) are ignored.
+    const zon_source = std.Io.Dir.cwd().readFileAllocOptions(
+        b.graph.io,
+        "build.zig.zon",
+        b.allocator,
+        .unlimited,
+        .of(u8),
+        0,
+    ) catch |err| std.debug.panic("cannot read build.zig.zon: {s}", .{@errorName(err)});
+    var zon_diagnostics: std.zon.parse.Diagnostics = undefined;
+    const zon = std.zon.parse.fromSlice(struct { version: []const u8 }, .{
+        .gpa = b.allocator,
+        .arena = b.allocator,
+        .source = zon_source,
+        .diagnostics = &zon_diagnostics,
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        zon_diagnostics.log("build.zig.zon");
+        std.debug.panic("cannot read the version out of build.zig.zon: {s}", .{@errorName(err)});
+    };
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", zon.version);
+    exe.root_module.addImport("build_options", build_options.createModule());
+
     // librats.a is a static C++ archive built with GCC's libstdc++ (its objects
     // reference the __cxx11 std::string ABI), so it must be linked against the
     // system libstdc++, NOT Zig's bundled libc++.

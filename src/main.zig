@@ -9,6 +9,12 @@ const default_room = "rekarma";
 const default_file = "all.txt";
 const default_count: usize = 1000;
 
+/// The version of this program, taken from build.zig.zon by build.zig (there is
+/// no accessor for the manifest at runtime): the manifest stays the one place a
+/// release is bumped. The librats half of --version needs no constant at all —
+/// it is read out of the linked library.
+const version = @import("build_options").version;
+
 /// Bound into the librats handshake: a node of a different app cannot connect.
 const protocol = "rekarma/1.0";
 
@@ -61,6 +67,13 @@ fn run(init: std.process.Init) !void {
     }
     if (opts.help) {
         try printUsage(out);
+        try out.flush();
+        return;
+    }
+    // Like --help, this answers a question about the program rather than doing
+    // the program's work: no daemon is forked and no node is created.
+    if (opts.version) {
+        try printVersions(out);
         try out.flush();
         return;
     }
@@ -543,6 +556,8 @@ fn parseArgs(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
             break :parse;
         } else if (std.mem.eql(u8, name, "-h") or std.mem.eql(u8, name, "--help")) {
             opts.help = true;
+        } else if (std.mem.eql(u8, name, "--version")) {
+            opts.version = true;
         } else if (std.mem.eql(u8, name, "-v") or std.mem.eql(u8, name, "--verbose")) {
             opts.verbose = true;
         } else if (std.mem.eql(u8, name, "--show")) {
@@ -716,6 +731,9 @@ const Options = struct {
     verbose: bool = false,
     show: bool = false,
     help: bool = false,
+    /// Print the versions of this program and of the librats it is linked
+    /// against, then exit.
+    version: bool = false,
     /// Record in the background: fork into a session of its own and put the
     /// standard streams in a log file.
     daemon: bool = false,
@@ -768,6 +786,7 @@ fn printUsage(out: *Io.Writer) !void {
         \\      --serve-relay      also carry other peers' traffic (uses this uplink)
         \\      --show             print the room's last messages and exit
         \\  -v, --verbose          show librats' own INFO logs on stdout
+        \\      --version          print rekarma's and librats' versions and exit
         \\  -h, --help             this help
         \\
         \\Examples:
@@ -781,11 +800,20 @@ fn printUsage(out: *Io.Writer) !void {
     , .{ default_room, default_file, default_count });
 }
 
-/// The version is read out of the linked librats library itself, not from a
-/// constant in this project.
-fn printBanner(out: *Io.Writer) !void {
-    try out.print("ReKarma - distributed recommendation system\n", .{});
+/// `--version`: what this program is and what it is linked against, one fact per
+/// line so a script can grep it. Every other option answers "how do I run this";
+/// this one answers "which build is this" and touches neither the network nor
+/// the room's file.
+fn printVersions(out: *Io.Writer) !void {
+    try out.print("rekarma {s}\n", .{version});
+    try printLibratsVersion(out);
+}
 
+/// The librats half of the version answer. It is read out of the linked library
+/// itself rather than from a constant in this project: the point of the question
+/// is which archive is actually in the binary, and a constant could only ever
+/// agree with the build.zig.zon pin, not with the library.
+fn printLibratsVersion(out: *Io.Writer) !void {
     var major: c_int = 0;
     var minor: c_int = 0;
     var patch: c_int = 0;
@@ -798,6 +826,11 @@ fn printBanner(out: *Io.Writer) !void {
     try out.print("librats abi 0x{x:0>6}, git {s}\n", .{
         c.rats_abi(), std.mem.span(c.rats_git_describe()),
     });
+}
+
+fn printBanner(out: *Io.Writer) !void {
+    try out.print("ReKarma - distributed recommendation system\n", .{});
+    try printLibratsVersion(out);
     // Flushed here, not with the rest: everything after this point can block on
     // the network (DHT bootstrap), and a banner still in the buffer would make a
     // slow start look like a hang.
