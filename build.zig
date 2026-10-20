@@ -13,7 +13,7 @@ pub fn build(b: *std.Build) void {
         );
     };
 
-    // Vendored librats 3.0.0 (prebuilt linux-x64 release). Provenance and the
+    // Vendored librats 3.0.1 (prebuilt linux-x64 release). Provenance and the
     // hand-written features.h substitution: scripts/librats/features.h.
     const librats_include = b.path("vendor/librats/include");
     const librats_lib = b.path("vendor/librats/librats.a");

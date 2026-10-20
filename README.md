@@ -15,9 +15,9 @@ ReKarma - distributed recommendation system
 ### librats
 
 Nothing from librats lives in the repository. `install.sh` downloads the prebuilt
-release `librats-linux-x64-3.0.0.zip`
-(https://github.com/librats/librats/releases/download/3.0.0/librats-linux-x64-3.0.0.zip,
-sha256 `84fd5cb4017c557c72e8c5c087c94b31e9a8f75188c2448cafe3da505b444931`) and
+release `librats-linux-x64-3.0.1.zip`
+(https://github.com/librats/librats/releases/download/3.0.1/librats-linux-x64-3.0.1.zip,
+sha256 `7885a46b24378cb0d256eddbec895b1727d7ae842456247bcd413dbdcce95f3b`) and
 unpacks it into `vendor/librats/`, which `.gitignore` excludes. The same happens
 by calling the script directly:
 
