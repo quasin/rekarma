@@ -6,10 +6,10 @@
 # clone, before `zig build`.
 set -euo pipefail
 
-LIBRATS_VERSION="${LIBRATS_VERSION:-3.0.0}"
+LIBRATS_VERSION="${LIBRATS_VERSION:-3.0.1}"
 LIBRATS_ARCH="${LIBRATS_ARCH:-linux-x64}"
 URL="https://github.com/librats/librats/releases/download/${LIBRATS_VERSION}/librats-${LIBRATS_ARCH}-${LIBRATS_VERSION}.zip"
-SHA256="${LIBRATS_SHA256:-84fd5cb4017c557c72e8c5c087c94b31e9a8f75188c2448cafe3da505b444931}"
+SHA256="${LIBRATS_SHA256:-7885a46b24378cb0d256eddbec895b1727d7ae842456247bcd413dbdcce95f3b}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 vendor_dir="$repo_root/vendor/librats"
