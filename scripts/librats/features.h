@@ -3,12 +3,12 @@
 /*
  * Local patch to librats, NOT an upstream file.
  *
- * Build/source: librats-linux-x64-3.0.0.zip
- *   https://github.com/librats/librats/releases/download/3.0.0/librats-linux-x64-3.0.0.zip
- *   sha256 84fd5cb4017c557c72e8c5c087c94b31e9a8f75188c2448cafe3da505b444931
+ * Build/source: librats-linux-x64-3.0.2.zip
+ *   https://github.com/librats/librats/releases/download/3.0.2/librats-linux-x64-3.0.2.zip
+ *   sha256 195544a0f9a7b6f9465ed5c551674553976d8df962635973327583a841a16974
  *
  * librats generates this header from features.h.in at CMake time and every
- * public header reaches it through librats/util/rats_export.h — but the 3.0.0
+ * public header reaches it through librats/util/rats_export.h — but the 3.0.2
  * release archive does not ship it, so the shipped headers cannot be included
  * as-is. This file is that missing piece, hand-written to match the build the
  * archive's librats.a was compiled with (checked against its exported symbols:
