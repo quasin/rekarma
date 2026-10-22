@@ -134,9 +134,9 @@ give a sender `--wait` if the DHT needs longer than its default 90 s.
   survive it), the parent prints pid/log/pid file and `_exit`s, and the child
   keeps serving. Defaults are `<cache>/magnet.log` and `<cache>/magnet.pid`;
   `--log`/`--pid` override them, `--mount` still decides the mount point.
-- The FUSE read window is `kPrefetchBytes` (64 MB) past the read, not a piece
-  count: a piece count means 128 MB of lookahead on a 4 MB-piece torrent and
-  8 MB on a 256 KB-piece one. It also keeps `kKeepBehindPieces` pieces behind the
+- The FUSE read window is `kPrefetchBytes` (128 MB) past the read, not a piece
+  count: a piece count means 256 MB of lookahead on a 4 MB-piece torrent and
+  16 MB on a 256 KB-piece one. It also keeps `kKeepBehindPieces` pieces behind the
   start, so a window advancing in 128 KB steps does not discard a piece that is
   halfway through its blocks. `pump_range` only touches pieces entering and
   leaving the window — a full rescan per read is invisible at 400 pieces and

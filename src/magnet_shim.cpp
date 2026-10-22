@@ -152,11 +152,13 @@ bool read_piece(DiskIo& disk, uint32_t piece, uint32_t offset, uint32_t length, 
 }
 
 /// How far past a read's end to keep fetching, in bytes. A player reads a few
-/// hundred KB at a time and wants the next second of video already here; 16 MB
-/// covers that at any sane bitrate. Expressed in bytes rather than pieces
-/// because piece length is the torrent's choice — 32 pieces of a 4 MB-piece
-/// torrent would be 128 MB of lookahead per read.
-constexpr uint64_t kPrefetchBytes = 64ull * 1024 * 1024;
+/// hundred KB at a time and wants the next second of video already here; the
+/// window is deliberately generous (128 MB) because a seek costs a full stall
+/// while the first piece of the new position is fetched, and the extra depth is
+/// what keeps a 4K stream ahead of itself on a fast swarm. Expressed in bytes
+/// rather than pieces because piece length is the torrent's choice — 32 pieces
+/// of a 4 MB-piece torrent would be 128 MB of lookahead per read.
+constexpr uint64_t kPrefetchBytes = 128ull * 1024 * 1024;
 
 /// Pieces behind a read's start that stay prioritised: a window that advances in
 /// 128 KB steps would otherwise drop a piece that is halfway through its blocks
