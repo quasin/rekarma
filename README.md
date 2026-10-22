@@ -14,35 +14,39 @@ ReKarma - distributed recommendation system
 
 ### librats
 
-Nothing from librats lives in the repository. `install.sh` downloads the prebuilt
-release `librats-linux-x64-3.0.2.zip`
-(https://github.com/librats/librats/releases/download/3.0.2/librats-linux-x64-3.0.2.zip,
-sha256 `195544a0f9a7b6f9465ed5c551674553976d8df962635973327583a841a16974`) and
-unpacks it into `vendor/librats/`, which `.gitignore` excludes. The same happens
-by calling the script directly:
+Nothing from librats lives in the repository. `install.sh` builds librats from
+the pinned source tarball (3.0.2, sha256
+`4454af32d2585be892c72307468633f7465f3e79eda0ff0b0bdfe5401dbc5c3d`) and installs
+the result into `vendor/librats/`, which `.gitignore` excludes:
 
-    vendor/librats/include/    librats public headers  (downloaded)
-    vendor/librats/librats.a   static library linux-x64 (downloaded, 6 MB)
+    vendor/librats/include/    librats public headers + generated features.h
+    vendor/librats/librats.a   static library
 
     bash scripts/fetch-librats.sh    # after a clone, or to re-fetch/bump
 
 `zig build` refuses to start with a pointed message when `vendor/librats/` is
 missing.
 
-Two things to know about this release:
+The build is from source, not from the prebuilt release archive, for one reason:
+`RATS_SEARCH_FEATURES` — the whole bittorrent stack, magnet links included — is
+off in the CMake defaults, so the release archives ship `rats_bt_add_magnet` and
+friends as stubs answering `RATS_ERR_NOT_ENABLED`. `--magnet` needs a library
+that really has that stack, so `scripts/fetch-librats.sh` configures the build
+with `-DRATS_SEARCH_FEATURES=ON -DRATS_STORAGE=ON` and therefore needs `cmake`,
+`g++` and `make` (`apt install cmake g++ make` or the distribution's equivalent).
 
-1. It does not ship the generated `include/librats/util/features.h`, which every
-   public header reaches through `rats_export.h`, so the shipped headers cannot
-   be included as-is. Our hand-written replacement is tracked at
-   `scripts/librats/features.h` and the fetch script copies it into the unpacked
-   tree.
+Two things to know about the result:
+
+1. `cmake --install` generates `include/librats/util/features.h`, which every
+   public header reaches through `rats_export.h`; the source build supplies it,
+   so the hand-written shim the old release-based fetch needed is gone.
 2. `librats.a` is C++ compiled with GCC's libstdc++ (`__cxx11` ABI), so the
    executable links the system libstdc++ and libgcc_s rather than Zig's bundled
    libc++. Override the paths with `-Dlibstdcpp=` / `-Dlibgcc_s=` if they live
    elsewhere.
 
-Prebuilt slices exist for linux-x64 only; other targets need librats built from
-source.
+`--magnet` also needs libfuse3 at build and run time (`fuse3-devel` /
+`libfuse3-dev`); the mount is served through `src/fuse_glue.c`.
 
 ### Build
 
@@ -106,3 +110,48 @@ Two caveats worth knowing before blaming the DHT:
   through it, or `--connect` to wire the two ends directly.
 
 `--no-mdns`, `--no-dht` and `--no-nat` isolate one layer at a time.
+
+### Mounting a release (FUSE 3)
+
+`--magnet` mounts a torrent instead of recording a room: the release appears as
+a read-only directory tree, its entries come from the torrent's metadata, and
+the bytes of a file are fetched only when something reads them.
+
+    rekarma --magnet 'magnet:?xt=urn:btih:…'        # mounts at mnt/<name>
+    rekarma --magnet 'magnet:?xt=urn:btih:…' -m /mnt/rel --cache /var/cache/rekarma
+    rekarma --magnet 81db4118adc4332d9d1cfff9d80667c4dfcf5848   # bare info-hash
+
+    rekarma --magnet '<hash>' --daemon               # mount in the background
+    kill $(cat .rekarma/magnet.pid)                   # unmount and stop
+
+    ls -R /mnt/rel                    # metadata only: no payload is fetched
+    mpv "/mnt/rel/<file>"             # reads on demand, piece by piece
+    umount /mnt/rel                   # or Ctrl-C in the serving terminal
+
+Quote the link in the shell — `?` and `&` are special there — or pass a bare
+40-hex / 32-base32 info-hash, which is completed into a magnet link internally.
+`-c host:port` seeds peers into the torrent as well as into the node, which is
+how a magnet with no trackers and no DHT is wired by hand.
+
+With `--daemon` the mount is served by a detached process, like the room's
+recorder: the foreground command forks before the bittorrent client exists,
+prints the pid and exits, and the child keeps the mount alive with its output in
+`<cache>/magnet.log` and its pid in `<cache>/magnet.pid` (`--log` / `--pid`
+override both). `kill $(cat <pid file>)` unmounts through the same SIGTERM path
+as Ctrl-C. A read that has to wait for the swarm says so in that log
+(`waiting for pieces N..M (… peers)`), so a slow start or a seek is visibly a
+wait rather than a hang. A read is never aborted on elapsed time: while the
+torrent still has peers it keeps waiting (64 MB of lookahead),
+and only a swarm that has disappeared makes it fail — a player cannot retry a
+failed read, and that error is what looks like "playback stops mid-file".
+
+How it works: `src/magnet_shim.cpp` (C++) drives librats' bittorrent client — the
+C bindings stop at "add magnet, download everything", while a mount needs the
+metadata, piece priorities and piece reads — and `src/magnet_fs.zig` +
+`src/fuse_glue.c` serve the file tree. Every piece starts as `DontDownload`; a
+read marks the pieces it covers (plus a few ahead) as `High` and blocks until
+they verify, so an untouched file costs nothing and a mounted 100 GB release
+does not pull 100 GB. Seeking is the same mechanism: the pieces of every read
+still in flight stay prioritised, so a seek does not starve the read it
+interrupted. Pieces land in `--cache` (`[.rekarma]`), keyed by the torrent's own
+paths, so a second run resumes what is already there.

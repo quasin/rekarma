@@ -9,9 +9,11 @@ zig-out/
 /all.txt.log
 /all.txt.pid
 
-# vendor/librats/ is generated, never committed: scripts/fetch-librats.sh
-# downloads the prebuilt release (6 MB librats.a + upstream headers) into it, and
-# install.sh calls that script. Run it once after a clone, before `zig build`.
-# The hand-written librats/util/features.h the release omits lives in
-# scripts/librats/features.h (tracked) and is copied in by the same script.
+# `rekarma --magnet` writes its pieces here by default (--cache changes it), plus
+# the daemon's log and pid file when the mount is detached.
+/.rekarma/
+
+# vendor/librats/ is generated, never committed: scripts/fetch-librats.sh builds
+# librats from source (search features ON, so bittorrent/--magnet works) into it,
+# and install.sh calls that script. Run it once after a clone, before `zig build`.
 /vendor/

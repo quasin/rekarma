@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const c = @import("c");
 const room_log = @import("room_log.zig");
+const magnet = @import("magnet.zig");
 
 /// One room and one file for everyone who just runs the program; --room and
 /// --file are how a second room — or a second log of the same one — is chosen.
@@ -75,6 +76,49 @@ fn run(init: std.process.Init) !void {
     if (opts.version) {
         try printVersions(out);
         try out.flush();
+        return;
+    }
+
+    // --magnet is a mode of its own: no room, no recording file, no node. It
+    // mounts a release through FUSE and reads it on demand, so everything below
+    // (log file, daemon fork, pubsub node) is wrong for it and is skipped.
+    if (opts.magnet) |uri| {
+        try printBanner(out);
+        c.rats_set_log_level(if (opts.verbose)
+            @intCast(c.RATS_LOG_INFO)
+        else
+            @intCast(c.RATS_LOG_WARN));
+
+        // Detached mount: the mount has to outlive the terminal like the room's
+        // recorder, and the fork must happen before the bittorrent client exists
+        // (its reactor threads would not survive a fork). The child keeps
+        // serving; this process just reports where it went.
+        if (opts.daemon) {
+            const cache = opts.cache orelse ".rekarma";
+            Io.Dir.cwd().createDirPath(io, cache) catch |err| {
+                try out.print("rekarma: cannot create the cache directory {s}: {s}\n", .{ cache, @errorName(err) });
+                try out.flush();
+                std.process.exit(1);
+            };
+            try out.print("rekarma: the mount will be at {s} (or --mount)\n", .{
+                if (opts.mount) |m| m else "mnt/<torrent name>",
+            });
+            try out.flush();
+            const base = try std.fmt.allocPrint(arena, "{s}/magnet", .{cache});
+            try daemonize(arena, io, out, base, opts);
+        }
+
+        const peers = try arena.alloc(magnet.Peer, opts.peers.items.len);
+        for (opts.peers.items, 0..) |peer, i| peers[i] = .{ .host = peer.host, .port = peer.port };
+
+        try magnet.run(io, gpa, out, .{
+            .magnet = uri,
+            .mount = opts.mount,
+            .cache = opts.cache,
+            .port = opts.port,
+            .dht = opts.discovery and opts.dht,
+            .peers = peers,
+        });
         return;
     }
 
@@ -560,6 +604,21 @@ fn parseArgs(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
             opts.version = true;
         } else if (std.mem.eql(u8, name, "-v") or std.mem.eql(u8, name, "--verbose")) {
             opts.verbose = true;
+        } else if (std.mem.eql(u8, name, "--magnet")) {
+            opts.magnet = reader.value(attached) orelse {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} needs a magnet link", .{name});
+                break :parse;
+            };
+        } else if (std.mem.eql(u8, name, "-m") or std.mem.eql(u8, name, "--mount")) {
+            opts.mount = reader.value(attached) orelse {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} needs a directory", .{name});
+                break :parse;
+            };
+        } else if (std.mem.eql(u8, name, "--cache")) {
+            opts.cache = reader.value(attached) orelse {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} needs a directory", .{name});
+                break :parse;
+            };
         } else if (std.mem.eql(u8, name, "--show")) {
             opts.show = true;
         } else if (std.mem.eql(u8, name, "--daemon")) {
@@ -664,6 +723,24 @@ fn parseArgs(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
         if (opts.daemon and opts.show) {
             opts.problem = "--daemon and --show ask for opposite things: one stays up, the other prints and exits";
         }
+        // --magnet mounts a release: it is its own mode and owns the process,
+        // so room-style options that would run a second, unrelated job (a
+        // message, --stay, --daemon, --show, the room's file) are refused rather
+        // than silently ignored.
+        if (opts.magnet != null) {
+            if (opts.message.items.len != 0) {
+                opts.problem = "--magnet mounts a release; a message given with it would never be published";
+            } else if (opts.show) {
+                opts.problem = "--magnet mounts a release; --show prints the room's log instead";
+            } else if (opts.stay) {
+                opts.problem = "--magnet already stays up for the whole mount; --stay is for the room";
+            } else if (opts.magnet.?.len == 0) {
+                opts.problem = "the magnet link cannot be empty";
+            } else if (!magnet.looksValid(opts.magnet.?)) {
+                opts.problem = "not a magnet link or info-hash: magnet:?xt=urn:btih:…, " ++
+                    "a 40-hex/32-base32 hash, or xt=urn:btih:… (quote it in the shell)";
+            }
+        }
     }
 
     return opts;
@@ -745,6 +822,12 @@ const Options = struct {
     log: ?[]const u8 = null,
     /// Where a daemon records its pid; null = next to the room's file.
     pid: ?[]const u8 = null,
+    /// A magnet link: mount that release instead of recording a room.
+    magnet: ?[]const u8 = null,
+    /// Where the magnet's release is mounted; null = mnt/<torrent name>.
+    mount: ?[]const u8 = null,
+    /// Where the magnet's pieces are written and kept; null = .rekarma.
+    cache: ?[]const u8 = null,
     /// Set instead of the options when the command line does not parse.
     problem: ?[]const u8 = null,
 };
@@ -785,6 +868,15 @@ fn printUsage(out: *Io.Writer) !void {
         \\      --no-relay         never route through another peer
         \\      --serve-relay      also carry other peers' traffic (uses this uplink)
         \\      --show             print the room's last messages and exit
+        \\
+        \\Mount a release (FUSE 3, read-only, on demand):
+        \\      --magnet <link>    mount the torrent a magnet link names; a bare
+        \\                         info-hash or xt=urn:btih:… also works
+        \\                         (quote the link: the shell eats ? and &)
+        \\  -m, --mount <dir>     where to mount it                [mnt/<name>]
+        \\      --cache <dir>      where pieces are written and kept [.rekarma]
+        \\                         browsing costs the metadata only; a file is
+        \\                         fetched when it is read, piece by piece
         \\  -v, --verbose          show librats' own INFO logs on stdout
         \\      --version          print rekarma's and librats' versions and exit
         \\  -h, --help             this help
@@ -796,6 +888,10 @@ fn printUsage(out: *Io.Writer) !void {
         \\  rekarma --daemon                 record the default room in the background
         \\  rekarma --daemon -r news -f "logs/{{room}}.txt" -n 50
         \\  rekarma --show                   print all.txt's last 1000 messages
+        \\  rekarma --magnet "magnet:?xt=urn:btih:…"    mount a release at mnt/<name>
+        \\  rekarma --magnet "magnet:?xt=urn:btih:…" -m /mnt/rel --cache /var/cache/rekarma
+        \\  ls /mnt/rel                     browse without downloading the release
+        \\  mpv "/mnt/rel/<file>"           read one file as its pieces arrive
         \\
     , .{ default_room, default_file, default_count });
 }

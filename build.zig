@@ -13,8 +13,10 @@ pub fn build(b: *std.Build) void {
         );
     };
 
-    // Vendored librats 3.0.2 (prebuilt linux-x64 release). Provenance and the
-    // hand-written features.h substitution: scripts/librats/features.h.
+    // Vendored librats 3.0.2, built from source by scripts/fetch-librats.sh with
+    // RATS_SEARCH_FEATURES=ON (the prebuilt release archives have the bittorrent
+    // stack stubbed out, and --magnet needs it). The script also installs the
+    // generated librats/util/features.h next to these headers.
     const librats_include = b.path("vendor/librats/include");
     const librats_lib = b.path("vendor/librats/librats.a");
 
@@ -31,6 +33,16 @@ pub fn build(b: *std.Build) void {
         "libgcc_s",
         "path to the system libgcc_s.so used to link librats.a",
     ) orelse "/usr/lib/libgcc_s.so.1";
+
+    // libfuse3 ships its headers one level down (fuse3/fuse.h) and outside the
+    // default include search path; override for a distribution that puts them
+    // elsewhere.
+    const fuse_include = b.option(
+        []const u8,
+        "fuse_include",
+        "directory holding fuse3/fuse.h",
+    ) orelse "/usr/include/fuse3";
+    const fuse_lib = b.option([]const u8, "fuse_lib", "libfuse3 link name") orelse "fuse3";
 
     // librats ships C++ headers; its public C ABI is librats/bindings/rats.h.
     // Zig 0.17 has no inline @cImport, so the header is translated into a module.
@@ -92,6 +104,28 @@ pub fn build(b: *std.Build) void {
     // libstdc++'s unwinder lives in libgcc_s; its objects reference _Unwind_Resume.
     exe.root_module.addObjectFile(.{ .cwd_relative = libgcc_s_path });
 
+    // The bittorrent half of --magnet is C++ (librats exposes no C API for
+    // metadata, piece priorities or piece reads) and is compiled by the system
+    // g++: Zig's own C++ driver uses the bundled libc++ headers, which do not
+    // match the __cxx11 libstdc++ librats.a was built against. The object is
+    // linked into the same module, so it sees the same archive.
+    const shim = b.addSystemCommand(&.{ "g++", "-std=c++17", "-O2", "-fPIC", "-c" });
+    shim.addArg("-I");
+    shim.addDirectoryArg(librats_include);
+    shim.addFileArg(b.path("src/magnet_shim.cpp"));
+    shim.addArg("-o");
+    const shim_object = shim.addOutputFileArg("magnet_shim.o");
+    exe.root_module.addObjectFile(shim_object);
+
+    // libfuse3 through one small C file: struct fuse_operations and struct stat
+    // are layout-heavy and stay in C, while the filesystem itself is Zig.
+    exe.root_module.addCSourceFile(.{
+        .file = b.path("src/fuse_glue.c"),
+        .flags = &.{"-std=c11"},
+    });
+    exe.root_module.addIncludePath(.{ .cwd_relative = fuse_include });
+    exe.root_module.linkSystemLibrary(fuse_lib, .{});
+
     b.installArtifact(exe);
 
     // The room log is pure Zig — no librats, no C module — so its unit tests need
@@ -103,8 +137,20 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // The torrent tree is the same kind of code: pure Zig, no engine and no
+    // FUSE, so it is tested on its own — the path/offset mapping is the one
+    // place a mounted release could hand out the wrong bytes.
+    const tree_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/magnet_tree.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(log_tests).step);
+    test_step.dependOn(&b.addRunArtifact(tree_tests).step);
 
     const run_step = b.step("run", "Run the app");
 
