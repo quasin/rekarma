@@ -12,41 +12,67 @@ ReKarma - distributed recommendation system
 2. Autonomi - https://github.com/WithAutonomi
 3. Zig - https://codeberg.org/ziglang
 
-### librats
+### librats and libfuse3
 
-Nothing from librats lives in the repository. `install.sh` builds librats from
-the pinned source tarball (3.0.2, sha256
-`4454af32d2585be892c72307468633f7465f3e79eda0ff0b0bdfe5401dbc5c3d`) and installs
-the result into `vendor/librats/`, which `.gitignore` excludes:
+Nothing from either C dependency lives in the repository. `install.sh` builds
+both from the pinned source tarballs and installs the results under `vendor/`,
+which `.gitignore` excludes — one directory per target triple:
 
-    vendor/librats/include/    librats public headers + generated features.h
-    vendor/librats/librats.a   static library
+    vendor/librats/<triple>/include/, librats.a   the engine   (3.0.4, sha256
+                                                                36e21f34cebef6fb0845f6498f1d91f9c62b944f9a594fe1899b702337f89a1a)
+    vendor/fuse3/<triple>/include/, libfuse3.a    the mount    (3.18.3, sha256
+                                                                bcd19582c5e30f7fe45dd86a5540e998590aa01903afc7ebcbeea6c8ac5421ee)
+
+`<triple>` is `x86_64-linux-gnu`, `aarch64-linux-gnu` or `riscv64-linux-gnu`.
 
     bash scripts/fetch-librats.sh    # after a clone, or to re-fetch/bump
+    bash scripts/fetch-fuse3.sh      # the same, for the mount library
 
-`zig build` refuses to start with a pointed message when `vendor/librats/` is
-missing.
+Both take an optional triple list (`bash scripts/fetch-librats.sh
+aarch64-linux-gnu`) and replace the triple's directory wholesale. `zig build`
+refuses to start with a pointed message when the triple it builds for was never
+vendored.
 
-The build is from source, not from the prebuilt release archive, for one reason:
-`RATS_SEARCH_FEATURES` — the whole bittorrent stack, magnet links included — is
-off in the CMake defaults, so the release archives ship `rats_bt_add_magnet` and
-friends as stubs answering `RATS_ERR_NOT_ENABLED`. `--magnet` needs a library
-that really has that stack, so `scripts/fetch-librats.sh` configures the build
-with `-DRATS_SEARCH_FEATURES=ON -DRATS_STORAGE=ON` and therefore needs `cmake`,
-`g++` and `make` (`apt install cmake g++ make` or the distribution's equivalent).
+Both are built by Zig's own driver (`zig cc` / `zig c++ -target <triple>`), not
+by a cross toolchain: it needs no root, and it emits objects against Zig's
+bundled libc++/glibc, which is what the final link uses. That is what lets one
+tree produce all three binaries:
 
-Two things to know about the result:
+    zig build                                 # host -> zig-out/bin/rekarma
+    zig build dist                            # all three -> zig-out/<triple>/rekarma
+    zig build -Dtarget=aarch64-linux-gnu
+
+Requirements: `cmake`, `make`, `curl`, `tar`, plus `meson` and `ninja` for
+libfuse3 (`pip install --user meson ninja`), and Zig 0.17.0. libfuse3 headers are
+no longer needed to build — the library is vendored — but `fusermount3` is still
+needed at run time, because that is the helper libfuse execs to mount.
+
+The engine is built from source, not from the prebuilt release archive, for one
+reason: `RATS_SEARCH_FEATURES` — the whole bittorrent stack, magnet links
+included — is off in the CMake defaults, so the release archives ship
+`rats_bt_add_magnet` and friends as stubs answering `RATS_ERR_NOT_ENABLED`.
+`--magnet` needs a library that really has that stack, so
+`scripts/fetch-librats.sh` configures the build with `-DRATS_SEARCH_FEATURES=ON
+-DRATS_STORAGE=ON`.
+
+Three things to know about the result:
 
 1. `cmake --install` generates `include/librats/util/features.h`, which every
    public header reaches through `rats_export.h`; the source build supplies it,
    so the hand-written shim the old release-based fetch needed is gone.
-2. `librats.a` is C++ compiled with GCC's libstdc++ (`__cxx11` ABI), so the
-   executable links the system libstdc++ and libgcc_s rather than Zig's bundled
-   libc++. Override the paths with `-Dlibstdcpp=` / `-Dlibgcc_s=` if they live
-   elsewhere.
+2. the version `--version` prints is the library's own, read through
+   `rats_version()`/`rats_version_string()`. A tarball has no `.git`, so librats
+   would otherwise report the hardcoded `1.0.0.0`; the fetch script passes
+   `-DRATS_VERSION_OVERRIDE=<pin>` and reads the generated `version.h` back, so
+   the binary reports the tag it was really built from (`3.0.4.0`).
+3. both archives are compiled against Zig's bundled libc++, so the executable
+   links `link_libcpp` and needs no system libstdc++ — the `-Dlibstdcpp=` and
+   `-Dlibgcc_s=` options are gone.
 
-`--magnet` also needs libfuse3 at build and run time (`fuse3-devel` /
-`libfuse3-dev`); the mount is served through `src/fuse_glue.c`.
+`--magnet` serves the mount through `src/fuse_glue.c` and `src/magnet_shim.cpp`;
+the shim is compiled by Zig's C++ driver against the vendored headers, so the
+`private`-spelled-public members it touches are the ones the library was built
+from.
 
 ### Build
 

@@ -1,51 +1,52 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Default to the portable x86_64 baseline instead of the host CPU: Zig's
+    // default is `native`, which bakes in AVX-512 and friends and dies with
+    // SIGILL on any older machine the binary is copied to. Pass `-Dcpu=native`
+    // for a machine-local binary.
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .cpu_model = .baseline },
+    });
     const optimize = b.standardOptimizeOption(.{});
 
-    // Everything under vendor/ comes from the prebuilt librats release and is not
-    // committed: report the fix instead of a raw linker error when it is missing.
-    std.Io.Dir.cwd().access(b.graph.io, "vendor/librats/librats.a", .{}) catch {
-        std.debug.panic(
-            "librats is not vendored yet — run scripts/fetch-librats.sh (install.sh already does), then rebuild",
-            .{},
-        );
-    };
+    // Both C/C++ dependencies are vendored per target triple, because a static
+    // archive only links into a binary of the architecture it was compiled for:
+    //   vendor/librats/<triple>/{include,librats.a}   the engine
+    //   vendor/fuse3/<triple>/{include,libfuse3.a}    the mount
+    // scripts/fetch-librats.sh and scripts/fetch-fuse3.sh write these; nothing
+    // under vendor/ is committed.
+    const triple = tripleName(b, target.result);
 
-    // Vendored librats 3.0.2, built from source by scripts/fetch-librats.sh with
-    // RATS_SEARCH_FEATURES=ON (the prebuilt release archives have the bittorrent
-    // stack stubbed out, and --magnet needs it). The script also installs the
-    // generated librats/util/features.h next to these headers.
-    const librats_include = b.path("vendor/librats/include");
-    const librats_lib = b.path("vendor/librats/librats.a");
+    // Fail with the fix instead of a raw linker error when a target was never
+    // vendored (an empty archive path would otherwise reach the linker).
+    for ([_][2][]const u8{
+        .{ "librats", "librats.a" },
+        .{ "fuse3", "libfuse3.a" },
+    }) |dep| {
+        const archive = b.fmt("vendor/{s}/{s}/{s}", .{ dep[0], triple, dep[1] });
+        std.Io.Dir.cwd().access(b.graph.io, archive, .{}) catch {
+            std.debug.panic(
+                "{s} is not vendored for {s} — run `bash scripts/fetch-{s}.sh {s}`, then rebuild",
+                .{ dep[1], triple, dep[0], triple },
+            );
+        };
+    }
 
-    // Path to the system C++ runtime librats.a was built against; override with
-    // -Dlibstdcpp=/path/to/libstdc++.so on another distribution.
-    const stdcpp_path = b.option(
-        []const u8,
-        "libstdcpp",
-        "path to the system libstdc++.so used to link librats.a",
-    ) orelse "/usr/lib/libstdc++.so";
+    const librats_include = b.path(b.fmt("vendor/librats/{s}/include", .{triple}));
+    const librats_archive = b.path(b.fmt("vendor/librats/{s}/librats.a", .{triple}));
+    const fuse_include = b.path(b.fmt("vendor/fuse3/{s}/include", .{triple}));
+    const fuse_archive = b.path(b.fmt("vendor/fuse3/{s}/libfuse3.a", .{triple}));
 
-    const libgcc_s_path = b.option(
-        []const u8,
-        "libgcc_s",
-        "path to the system libgcc_s.so used to link librats.a",
-    ) orelse "/usr/lib/libgcc_s.so.1";
+    // The version the binary reports (--version, the banner) is the one
+    // build.zig.zon declares: injecting it here keeps a single place to bump
+    // instead of a constant in src/ that drifts from the manifest.
+    const opts = b.addOptions();
+    opts.addOption([]const u8, "version", @import("build.zig.zon").version);
 
-    // libfuse3 ships its headers one level down (fuse3/fuse.h) and outside the
-    // default include search path; override for a distribution that puts them
-    // elsewhere.
-    const fuse_include = b.option(
-        []const u8,
-        "fuse_include",
-        "directory holding fuse3/fuse.h",
-    ) orelse "/usr/include/fuse3";
-    const fuse_lib = b.option([]const u8, "fuse_lib", "libfuse3 link name") orelse "fuse3";
-
-    // librats ships C++ headers; its public C ABI is librats/bindings/rats.h.
-    // Zig 0.17 has no inline @cImport, so the header is translated into a module.
+    // librats exposes a C ABI at librats/bindings/rats.h; the headers around it
+    // are C++. Zig 0.17 has no inline @cImport, so they are translated into a
+    // module from src/c.h and imported as `c`.
     const translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/c.h"),
         .target = target,
@@ -60,73 +61,60 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = opts.createModule() },
+                .{ .name = "c", .module = translate_c.createModule() },
+            },
         }),
     });
 
-    exe.root_module.addImport("c", translate_c.createModule());
-
-    // The version the binary reports (--version, the banner) is the one
-    // build.zig.zon declares: injecting it here keeps a single place to bump
-    // instead of a constant in src/ that drifts from the manifest. There is no
-    // accessor for the root manifest, so it is read and parsed; the fields this
-    // binary does not need (name, fingerprint) are ignored.
-    const zon_source = std.Io.Dir.cwd().readFileAllocOptions(
-        b.graph.io,
-        "build.zig.zon",
-        b.allocator,
-        .unlimited,
-        .of(u8),
-        0,
-    ) catch |err| std.debug.panic("cannot read build.zig.zon: {s}", .{@errorName(err)});
-    var zon_diagnostics: std.zon.parse.Diagnostics = undefined;
-    const zon = std.zon.parse.fromSlice(struct { version: []const u8 }, .{
-        .gpa = b.allocator,
-        .arena = b.allocator,
-        .source = zon_source,
-        .diagnostics = &zon_diagnostics,
-        .ignore_unknown_fields = true,
-    }) catch |err| {
-        zon_diagnostics.log("build.zig.zon");
-        std.debug.panic("cannot read the version out of build.zig.zon: {s}", .{@errorName(err)});
-    };
-
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", zon.version);
-    exe.root_module.addImport("build_options", build_options.createModule());
-
-    // librats.a is a static C++ archive built with GCC's libstdc++ (its objects
-    // reference the __cxx11 std::string ABI), so it must be linked against the
-    // system libstdc++, NOT Zig's bundled libc++.
-    exe.root_module.addObjectFile(librats_lib);
-    exe.root_module.addIncludePath(librats_include);
-    exe.root_module.link_libc = true;
-    exe.root_module.addObjectFile(.{ .cwd_relative = stdcpp_path });
-    // libstdc++'s unwinder lives in libgcc_s; its objects reference _Unwind_Resume.
-    exe.root_module.addObjectFile(.{ .cwd_relative = libgcc_s_path });
-
-    // The bittorrent half of --magnet is C++ (librats exposes no C API for
-    // metadata, piece priorities or piece reads) and is compiled by the system
-    // g++: Zig's own C++ driver uses the bundled libc++ headers, which do not
-    // match the __cxx11 libstdc++ librats.a was built against. The object is
-    // linked into the same module, so it sees the same archive.
-    const shim = b.addSystemCommand(&.{ "g++", "-std=c++17", "-O2", "-fPIC", "-c" });
-    shim.addArg("-I");
-    shim.addDirectoryArg(librats_include);
-    shim.addFileArg(b.path("src/magnet_shim.cpp"));
-    shim.addArg("-o");
-    const shim_object = shim.addOutputFileArg("magnet_shim.o");
-    exe.root_module.addObjectFile(shim_object);
-
-    // libfuse3 through one small C file: struct fuse_operations and struct stat
-    // are layout-heavy and stay in C, while the filesystem itself is Zig.
-    exe.root_module.addCSourceFile(.{
-        .file = b.path("src/fuse_glue.c"),
-        .flags = &.{"-std=c11"},
-    });
-    exe.root_module.addIncludePath(.{ .cwd_relative = fuse_include });
-    exe.root_module.linkSystemLibrary(fuse_lib, .{});
+    wireSources(b, exe, librats_include, fuse_include);
+    exe.root_module.addObjectFile(librats_archive);
+    exe.root_module.addObjectFile(fuse_archive);
 
     b.installArtifact(exe);
+
+    // `zig build dist` builds all three published targets into
+    // zig-out/<triple>/rekarma in ReleaseSafe (panic messages kept, undefined
+    // behaviour not exploited). Each is a separate executable, because a build
+    // graph artifact has exactly one target.
+    const dist_targets = [_][]const u8{ "x86_64-linux-gnu", "aarch64-linux-gnu", "riscv64-linux-gnu" };
+    const dist_step = b.step("dist", "Build rekarma for linux x86_64/aarch64/riscv64");
+    for (dist_targets) |dt| {
+        const dt_target = b.resolveTargetQuery(.{ .cpu_arch = dtArch(dt), .os_tag = .linux, .abi = .gnu });
+        const dt_librats_include = b.path(b.fmt("vendor/librats/{s}/include", .{dt}));
+        const dt_fuse_include = b.path(b.fmt("vendor/fuse3/{s}/include", .{dt}));
+
+        const dt_translate_c = b.addTranslateC(.{
+            .root_source_file = b.path("src/c.h"),
+            .target = dt_target,
+            .optimize = .ReleaseSafe,
+            .link_libc = true,
+        });
+        dt_translate_c.addIncludePath(dt_librats_include);
+
+        const dt_exe = b.addExecutable(.{
+            .name = "rekarma",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = dt_target,
+                .optimize = .ReleaseSafe,
+                .strip = true,
+                .imports = &.{
+                    .{ .name = "build_options", .module = opts.createModule() },
+                    .{ .name = "c", .module = dt_translate_c.createModule() },
+                },
+            }),
+        });
+        wireSources(b, dt_exe, dt_librats_include, dt_fuse_include);
+        dt_exe.root_module.addObjectFile(b.path(b.fmt("vendor/librats/{s}/librats.a", .{dt})));
+        dt_exe.root_module.addObjectFile(b.path(b.fmt("vendor/fuse3/{s}/libfuse3.a", .{dt})));
+
+        const install = b.addInstallArtifact(dt_exe, .{
+            .dest_dir = .{ .override = .{ .custom = dt } },
+        });
+        dist_step.dependOn(&install.step);
+    }
 
     // The room log is pure Zig — no librats, no C module — so its unit tests need
     // nothing but the compiler and run in a watertight module of their own.
@@ -160,4 +148,50 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
 
     run_cmd.addPassthruArgs();
+}
+
+/// Everything both the host and each dist executable need: the C++ shim that
+/// reaches into librats' bittorrent engine, and the C glue that owns libfuse3's
+/// layout-heavy types.
+fn wireSources(b: *std.Build, exe: *std.Build.Step.Compile, librats_include: std.Build.LazyPath, fuse_include: std.Build.LazyPath) void {
+    const m = exe.root_module;
+    m.link_libc = true;
+    // Both archives are compiled by `zig c++`/`zig cc`, i.e. against Zig's
+    // bundled libc++ — the same C++ runtime this link pulls in. That is what
+    // makes them portable across targets instead of tied to a system libstdc++
+    // ABI.
+    m.link_libcpp = true;
+    m.addIncludePath(librats_include);
+    m.addIncludePath(fuse_include);
+
+    // The bittorrent half of --magnet is C++ (librats exposes no C API for
+    // metadata, piece priorities or piece reads). It is compiled by Zig's C++
+    // driver for the same target and links against the same archive, so the
+    // `private`-spelled-public member layout it depends on is the one the
+    // library was built from.
+    m.addCSourceFile(.{
+        .file = b.path("src/magnet_shim.cpp"),
+        .flags = &.{"-std=c++17"},
+    });
+
+    // libfuse3 through one small C file: struct fuse_operations and struct stat
+    // are layout-heavy and stay in C, while the filesystem itself is Zig.
+    m.addCSourceFile(.{
+        .file = b.path("src/fuse_glue.c"),
+        .flags = &.{"-std=c11"},
+    });
+}
+
+fn tripleName(b: *std.Build, r: std.Target) []const u8 {
+    return b.fmt("{s}-{s}-{s}", .{
+        @tagName(r.cpu.arch),
+        @tagName(r.os.tag),
+        @tagName(r.abi),
+    });
+}
+
+fn dtArch(triple: []const u8) std.Target.Cpu.Arch {
+    if (std.mem.startsWith(u8, triple, "aarch64")) return .aarch64;
+    if (std.mem.startsWith(u8, triple, "riscv64")) return .riscv64;
+    return .x86_64;
 }

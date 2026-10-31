@@ -13,7 +13,8 @@ zig-out/
 # the daemon's log and pid file when the mount is detached.
 /.rekarma/
 
-# vendor/librats/ is generated, never committed: scripts/fetch-librats.sh builds
-# librats from source (search features ON, so bittorrent/--magnet works) into it,
-# and install.sh calls that script. Run it once after a clone, before `zig build`.
+# vendor/ is generated, never committed: scripts/fetch-librats.sh builds librats
+# from source per target triple (search features ON, so bittorrent/--magnet
+# works) and scripts/fetch-fuse3.sh builds libfuse3 the same way. install.sh
+# calls both. Run them once after a clone, before `zig build`.
 /vendor/

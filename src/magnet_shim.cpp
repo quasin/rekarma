@@ -18,7 +18,7 @@
  * API, so this file compiles against the same headers with `private` spelled
  * `public` (see kPrivateHack below). Everything it then touches is a member
  * whose layout is fixed by the headers the library was built from — the same
- * 3.0.2 headers vendored into vendor/librats — and every access happens on the
+ * 3.0.4 headers vendored into vendor/librats — and every access happens on the
  * reactor thread through Reactor::post, which is the thread the engine itself
  * uses and the only one those members are safe on.
  *
@@ -27,8 +27,27 @@
  */
 
 // std must be fully included before `private` is redefined, or the standard
-// library's own members would be rewritten in this translation unit.
-#include <bits/stdc++.h>
+// library's own members would be rewritten in this translation unit. The list is
+// spelled out instead of <bits/stdc++.h> because this file is compiled by Zig's
+// C++ driver against the bundled libc++, which has no GCC internal headers.
+#include <algorithm>
+#include <cctype>
+#include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <functional>
+#include <future>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #define private public
 #include <librats/bittorrent/client.h>
