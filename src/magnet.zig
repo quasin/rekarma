@@ -16,6 +16,7 @@ const std = @import("std");
 const Io = std.Io;
 const fs = @import("magnet_fs.zig");
 const tree_mod = @import("magnet_tree.zig");
+const tracker = @import("tracker.zig");
 
 /// How long to wait for the info dict (BEP 9) before giving up. The DHT round
 /// is ~40 s, and a magnet whose only peer source is a tracker can take longer.
@@ -79,6 +80,10 @@ const BtProgress = extern struct {
 extern fn rek_bt_open(magnet: [*:0]const u8, cache: [*:0]const u8, port: u16, dht: c_int, err: [*]u8, err_len: usize) ?*anyopaque;
 extern fn rek_bt_open_torrent(path: [*:0]const u8, cache: [*:0]const u8, port: u16, dht: c_int, err: [*]u8, err_len: usize) ?*anyopaque;
 extern fn rek_bt_close(handle: ?*anyopaque) void;
+extern fn rek_bt_tracker_count(handle: ?*anyopaque) usize;
+extern fn rek_bt_tracker_url(handle: ?*anyopaque, index: usize, buf: [*]u8, len: usize) usize;
+extern fn rek_bt_identity(handle: ?*anyopaque, info_hash_hex: [*]u8, peer_id_hex: [*]u8, len: usize) void;
+extern fn rek_bt_listen_port(handle: ?*anyopaque) u16;
 extern fn rek_bt_add_peer(handle: ?*anyopaque, host: [*:0]const u8, port: u16) void;
 extern fn rek_bt_wait_metadata(handle: ?*anyopaque, timeout_ms: c_int) c_int;
 extern fn rek_bt_name(handle: ?*anyopaque) [*:0]const u8;
@@ -108,6 +113,8 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, params: Params) !voi
         std.process.exit(1);
     };
     defer rek_bt_close(handle);
+
+    try announceHttpsTrackers(io, gpa, handle, out, .started);
 
     for (params.peers) |peer| {
         const host_z = try gpa.dupeSentinel(u8, peer.host, 0);
@@ -189,6 +196,10 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, params: Params) !voi
     const rc = fs.run(mount_z, name_z);
     fs.unmount();
 
+    // Tell an https tracker we are gone, so it does not hold the peer slot (and
+    // a private tracker does not read the next run as a second client).
+    announceHttpsTrackers(io, gpa, handle, out, .stopped) catch {};
+
     var state: BtProgress = undefined;
     rek_bt_state(handle, &state);
     try out.print("\nunmounted {s} — {f} of {f} fetched ({d:.1}%), {d} peer(s)\n", .{
@@ -196,6 +207,89 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, params: Params) !voi
     });
     if (rc != 0) try out.print("rekarma: the mount ended with an error ({d})\n", .{rc});
     try out.flush();
+}
+
+/// Announce to the trackers the engine cannot reach.
+///
+/// librats has no TLS: it refuses an `https://` tracker outright, and since a
+/// private tracker's swarm is not on the DHT, such a release would otherwise
+/// mount and then wait forever for pieces. The announce is made from here
+/// (tracker.zig, through std.http.Client) and the peers are handed to the
+/// engine, which treats them like any other peer source.
+fn announceHttpsTrackers(
+    io: Io,
+    gpa: std.mem.Allocator,
+    handle: ?*anyopaque,
+    out: *Io.Writer,
+    event: tracker.Params.Event,
+) !void {
+    const count = rek_bt_tracker_count(handle);
+    if (count == 0) return;
+
+    var info_hash_hex: [41]u8 = undefined;
+    var peer_id_hex: [41]u8 = undefined;
+    rek_bt_identity(handle, &info_hash_hex, &peer_id_hex, info_hash_hex.len);
+
+    var state: BtProgress = undefined;
+    rek_bt_state(handle, &state);
+
+    var index: usize = 0;
+    while (index < count) : (index += 1) {
+        var url_buf: [512]u8 = undefined;
+        const len = rek_bt_tracker_url(handle, index, &url_buf, url_buf.len);
+        if (len == 0) continue;
+        const url = url_buf[0..len];
+        // http and udp trackers are librats' own business.
+        if (!std.mem.startsWith(u8, url, "https://")) continue;
+
+        const announced = tracker.announce(gpa, io, url, .{
+            .info_hash = hexToBytes(20, info_hash_hex[0..40]) orelse return,
+            .peer_id = hexToBytes(20, peer_id_hex[0..40]) orelse return,
+            .port = rek_bt_listen_port(handle),
+            .left = state.total_size -| state.downloaded,
+            .event = event,
+        }) catch |err| {
+            if (event == .started) {
+                try out.print("tracker  {s}: {s}\n", .{ url, @errorName(err) });
+                try out.flush();
+            }
+            continue;
+        };
+
+        if (announced.failure().len > 0) {
+            if (event == .started) {
+                try out.print("tracker  {s}: {s}\n", .{ url, announced.failure() });
+                try out.print("         a private tracker allows one peer per passkey: close the other\n" ++
+                    "         client, or pass -p with the port it announced from\n", .{});
+                try out.flush();
+            }
+            continue;
+        }
+
+        // A "stopped" announce only tells the tracker we are leaving; its peer
+        // list is not interesting and is not dialled.
+        if (event == .stopped) continue;
+
+        for (announced.peers[0..announced.peer_count]) |*peer| {
+            var host_buf: [17]u8 = undefined;
+            @memcpy(host_buf[0..peer.host_len], peer.host[0..peer.host_len]);
+            host_buf[peer.host_len] = 0;
+            rek_bt_add_peer(handle, host_buf[0..peer.host_len :0].ptr, peer.port);
+        }
+        try out.print("tracker  {s}: {d} peer(s){s}\n", .{
+            url, announced.peer_count, if (announced.skipped_v6 > 0) " (IPv6 peers skipped)" else "",
+        });
+        try out.flush();
+    }
+}
+
+fn hexToBytes(comptime n: usize, hex: []const u8) ?[n]u8 {
+    if (hex.len != n * 2) return null;
+    var out: [n]u8 = undefined;
+    for (0..n) |i| {
+        out[i] = std.fmt.parseInt(u8, hex[i * 2 .. i * 2 + 2], 16) catch return null;
+    }
+    return out;
 }
 
 /// "mnt/<name>": a mountpoint inside the cwd, so one run leaves one directory

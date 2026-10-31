@@ -54,6 +54,7 @@
 #include <librats/bittorrent/magnet_uri.h>
 #include <librats/bittorrent/torrent.h>
 #include <librats/bittorrent/torrent_info.h>
+#include <librats/bittorrent/tracker.h>
 #include <librats/dht/dht.h>
 #undef private
 
@@ -414,6 +415,47 @@ rek_bt* rek_bt_open_torrent(const char* torrent_path, const char* cache_dir, uin
         return nullptr;
     }
     return bt;
+}
+
+/// What an announce needs from the session, for src/tracker.zig: the engine
+/// cannot reach an https tracker at all, so the caller announces instead and
+/// feeds the peers back through rek_bt_add_peer.
+size_t rek_bt_tracker_count(rek_bt* bt) {
+    if (!bt || !bt->torrent) return 0;
+    return bt->torrent->info_.all_trackers().size();
+}
+
+/// Writes tracker @p index into @p buf (NUL-terminated) and returns its length,
+/// or 0 when there is no such tracker. A URL that does not fit is truncated.
+size_t rek_bt_tracker_url(rek_bt* bt, size_t index, char* buf, size_t len) {
+    if (!bt || !bt->torrent || !buf || len == 0) return 0;
+    const std::vector<std::string> urls = bt->torrent->info_.all_trackers();
+    if (index >= urls.size()) return 0;
+    std::snprintf(buf, len, "%s", urls[index].c_str());
+    return std::strlen(buf);
+}
+
+/// 40 hex chars + NUL for the info-hash and for the peer id, in that order.
+void rek_bt_identity(rek_bt* bt, char* info_hash_hex, char* peer_id_hex, size_t len) {
+    if (info_hash_hex && len) info_hash_hex[0] = 0;
+    if (peer_id_hex && len) peer_id_hex[0] = 0;
+    if (!bt || !bt->client || !info_hash_hex || !peer_id_hex || len < 41) return;
+
+    const InfoHash& hash = bt->torrent ? bt->torrent->info_hash() : bt->hash;
+    const PeerId&  peer_id = bt->client->peer_id();
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < hash.size(); ++i) {
+        info_hash_hex[i * 2]     = digits[hash[i] >> 4];
+        info_hash_hex[i * 2 + 1] = digits[hash[i] & 0x0f];
+        peer_id_hex[i * 2]       = digits[peer_id[i] >> 4];
+        peer_id_hex[i * 2 + 1]   = digits[peer_id[i] & 0x0f];
+    }
+    info_hash_hex[hash.size() * 2] = 0;
+    peer_id_hex[peer_id.size() * 2] = 0;
+}
+
+uint16_t rek_bt_listen_port(rek_bt* bt) {
+    return bt && bt->client ? bt->client->listen_port() : 0;
 }
 
 void rek_bt_close(rek_bt* bt) {

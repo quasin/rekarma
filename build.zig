@@ -135,10 +135,20 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // The tracker announce is a URL builder and a bencode reader — pure, and the
+    // part of the https path that can be tested without a network.
+    const tracker_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tracker.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(log_tests).step);
     test_step.dependOn(&b.addRunArtifact(tree_tests).step);
+    test_step.dependOn(&b.addRunArtifact(tracker_tests).step);
 
     const run_step = b.step("run", "Run the app");
 

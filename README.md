@@ -160,6 +160,13 @@ cannot find.
     mpv "/mnt/rel/<file>"             # reads on demand, piece by piece
     umount /mnt/rel                   # or Ctrl-C in the serving terminal
 
+librats cannot speak TLS, so an `https://` tracker is announced by rekarma
+itself (`src/tracker.zig`) and the peers it finds are handed to the engine; the
+announce is `started` when the mount opens and `stopped` when it goes away. A
+private tracker allows one peer per passkey: if another client already uses the
+passkey, the tracker refuses with "prohibited … multiple IPs or clients" — close
+that client, or start the mount with `-p` on the port it uses.
+
 Quote the link in the shell — `?` and `&` are special there — or pass a bare
 40-hex / 32-base32 info-hash, which is completed into a magnet link internally.
 `-c host:port` seeds peers into the torrent as well as into the node, which is

@@ -16,6 +16,7 @@ background, and can mount a release named by a magnet link or described by a
     src/room_log.zig              the room's file — last N messages, in memory and on disk
     src/c.h                       every C #include the project needs, in one header
     src/magnet.zig                --magnet/--torrent: open the session, print the tree, run the mount
+    src/tracker.zig               https announces librats cannot make (TLS + compact-peer parsing)
     src/magnet_shim.cpp           C++ shim over librats' bittorrent client (metadata, pieces)
     src/magnet_tree.zig           metadata -> directory tree + torrent byte offsets (unit-tested)
     src/magnet_fs.zig             FUSE callbacks: getattr/readdir/open/read/release
@@ -117,6 +118,17 @@ give a sender `--wait` if the DHT needs longer than its default 90 s.
   (`<path>: unexpected end of data`), never as a bare errno.
 - Both entry points share `start_session()` in the shim (cache dir, client, DHT),
   so a change to the node setup cannot reach one mode and miss the other.
+- **librats has no TLS, so `https://` trackers are announced from `tracker.zig`**
+  (`std.http.Client`), and the peers go back into the engine through
+  `rek_bt_add_peer`. Without this a *private* tracker release mounts and then
+  never gets a peer — its swarm is not on the DHT — which looks exactly like a
+  hung read. The announce is `started` on open and `stopped` on exit: a tracker
+  that is never told keeps the peer slot, and the next run is then refused as a
+  second client ("prohibited … from multiple IPs or clients"). A private tracker
+  allows one peer per passkey, so that refusal is also what a *running* client
+  with the same passkey produces — the message says to close it or reuse its
+  port with `-p`. http and udp trackers are still librats' own business, so the
+  same tracker is never announced twice.
 - The link may be a full `magnet:?…`, a bare 40-hex/32-base32 info-hash, or
   `xt=urn:btih:…`; `normalize_magnet()` in `magnet_shim.cpp` completes the last
   two. The shell eats `?` and `&`, so the usage text tells the user to quote it.
