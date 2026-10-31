@@ -139,15 +139,21 @@ Two caveats worth knowing before blaming the DHT:
 
 ### Mounting a release (FUSE 3)
 
-`--magnet` mounts a torrent instead of recording a room: the release appears as
-a read-only directory tree, its entries come from the torrent's metadata, and
-the bytes of a file are fetched only when something reads them.
+`--magnet` and `--torrent` mount a torrent instead of recording a room: the
+release appears as a read-only directory tree, its entries come from the
+torrent's metadata, and the bytes of a file are fetched only when something
+reads them. `--magnet` gets the metadata from the swarm (BEP 9), `--torrent`
+reads it out of a `.torrent` file — which is why a torrent file can be browsed
+with no peer at all, and why it is the way to mount a release the tracker or DHT
+cannot find.
 
     rekarma --magnet 'magnet:?xt=urn:btih:…'        # mounts at mnt/<name>
     rekarma --magnet 'magnet:?xt=urn:btih:…' -m /mnt/rel --cache /var/cache/rekarma
     rekarma --magnet 81db4118adc4332d9d1cfff9d80667c4dfcf5848   # bare info-hash
+    rekarma --torrent ~/release.torrent -m /mnt/rel  # metadata from the file
 
     rekarma --magnet '<hash>' --daemon               # mount in the background
+    rekarma --torrent release.torrent --daemon       # the same, from a file
     kill $(cat .rekarma/magnet.pid)                   # unmount and stop
 
     ls -R /mnt/rel                    # metadata only: no payload is fetched

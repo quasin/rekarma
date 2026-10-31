@@ -47,7 +47,12 @@ pub fn looksValid(link: []const u8) bool {
 }
 
 pub const Params = struct {
-    magnet: []const u8,
+    /// A magnet link (or bare info-hash) that names the release, or — with
+    /// `torrent` — the path of a .torrent file that carries its metadata.
+    source: []const u8,
+    /// `source` is a .torrent file: the info dict is read from disk instead of
+    /// being fetched from peers (BEP 9), so no swarm is needed to browse it.
+    torrent: bool = false,
     /// Where to mount; null = "mnt/<torrent name>".
     mount: ?[]const u8 = null,
     /// Where pieces are written and kept; null = ".rekarma".
@@ -72,6 +77,7 @@ const BtProgress = extern struct {
 };
 
 extern fn rek_bt_open(magnet: [*:0]const u8, cache: [*:0]const u8, port: u16, dht: c_int, err: [*]u8, err_len: usize) ?*anyopaque;
+extern fn rek_bt_open_torrent(path: [*:0]const u8, cache: [*:0]const u8, port: u16, dht: c_int, err: [*]u8, err_len: usize) ?*anyopaque;
 extern fn rek_bt_close(handle: ?*anyopaque) void;
 extern fn rek_bt_add_peer(handle: ?*anyopaque, host: [*:0]const u8, port: u16) void;
 extern fn rek_bt_wait_metadata(handle: ?*anyopaque, timeout_ms: c_int) c_int;
@@ -84,15 +90,19 @@ extern fn rek_bt_piece_length(handle: ?*anyopaque) u32;
 extern fn rek_bt_state(handle: ?*anyopaque, out: *BtProgress) void;
 
 pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, params: Params) !void {
-    const magnet_z = try gpa.dupeSentinel(u8, params.magnet, 0);
-    defer gpa.free(magnet_z);
+    const source_z = try gpa.dupeSentinel(u8, params.source, 0);
+    defer gpa.free(source_z);
     const cache = params.cache orelse ".rekarma";
     const cache_z = try gpa.dupeSentinel(u8, cache, 0);
     defer gpa.free(cache_z);
 
     // Zeroed so a failure with an empty message still prints something sane.
     var err_buf: [256]u8 = @splat(0);
-    const handle = rek_bt_open(magnet_z.ptr, cache_z.ptr, params.port, @intFromBool(params.dht), &err_buf, err_buf.len) orelse {
+    const opened = if (params.torrent)
+        rek_bt_open_torrent(source_z.ptr, cache_z.ptr, params.port, @intFromBool(params.dht), &err_buf, err_buf.len)
+    else
+        rek_bt_open(source_z.ptr, cache_z.ptr, params.port, @intFromBool(params.dht), &err_buf, err_buf.len);
+    const handle = opened orelse {
         try out.print("rekarma: {s}\n", .{std.mem.sliceTo(&err_buf, 0)});
         try out.flush();
         std.process.exit(1);
@@ -106,7 +116,14 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, params: Params) !voi
     }
 
     try out.print("cache    {s}\n", .{cache});
-    try out.print("waiting for the release's metadata (BEP 9)…\n", .{});
+    if (params.torrent) {
+        // The metadata is in the file: there is nothing to wait for but the
+        // one poll below, which is why this mode also works with no peers.
+        try out.print("torrent  {s}\n", .{params.source});
+        try out.print("reading the .torrent metadata…\n", .{});
+    } else {
+        try out.print("waiting for the release's metadata (BEP 9)…\n", .{});
+    }
     try out.flush();
 
     // Ask in one-second slices so the wait can say something instead of looking
@@ -115,8 +132,12 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, params: Params) !voi
     while (rek_bt_wait_metadata(handle, 1000) != 0) {
         waited += 1000;
         if (waited >= metadata_timeout_ms) {
-            try out.print("rekarma: no metadata after {d}s — no peer served the info dict\n", .{waited / 1000});
-            try out.print("         a magnet needs a peer: a tracker, the DHT (--no-dht turns it off) or --connect\n", .{});
+            if (params.torrent) {
+                try out.print("rekarma: the .torrent metadata did not become available after {d}s\n", .{waited / 1000});
+            } else {
+                try out.print("rekarma: no metadata after {d}s — no peer served the info dict\n", .{waited / 1000});
+                try out.print("         a magnet needs a peer: a tracker, the DHT (--no-dht turns it off) or --connect\n", .{});
+            }
             try out.flush();
             std.process.exit(1);
         }

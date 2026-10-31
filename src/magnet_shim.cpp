@@ -313,6 +313,40 @@ std::string normalize_magnet(const std::string& input) {
     return input;
 }
 
+/// Everything the magnet and the .torrent entry points share: the cache
+/// directory, the client and its DHT. What differs between them is only how the
+/// info dict is obtained — read from the file, or fetched from peers (BEP 9).
+rek_bt* start_session(const char* cache_dir, uint16_t port, int enable_dht, char* err, size_t err_len) {
+    std::error_code ec;
+    std::filesystem::create_directories(cache_dir, ec);
+    if (ec) {
+        set_error(err, err_len, "cannot create the cache directory");
+        return nullptr;
+    }
+
+    auto bt = std::make_unique<rek_bt>();
+
+    Client::Config config;
+    config.listen_port   = port;
+    config.download_path = cache_dir;
+    bt->client = std::make_unique<Client>(config);
+
+    // A magnet has no peer list of its own beyond trackers, and a torrent with
+    // no trackers would never find anything: one DHT client, bootstrapped and
+    // handed to the session, is the peer source. Failure is not fatal —
+    // trackers and --connect peers still work.
+    if (enable_dht) {
+        bt->dht = std::make_unique<DhtClient>(0);
+        if (bt->dht->start()) {
+            bt->dht->bootstrap(DhtClient::get_default_bootstrap_nodes());
+            bt->client->set_external_dht(bt->dht.get());
+        }
+    }
+
+    bt->client->start();
+    return bt.release();
+}
+
 } // namespace
 
 extern "C" {
@@ -334,41 +368,52 @@ rek_bt* rek_bt_open(const char* magnet_uri, const char* cache_dir, uint16_t port
         return nullptr;
     }
 
-    std::error_code ec;
-    std::filesystem::create_directories(cache_dir, ec);
-    if (ec) {
-        set_error(err, err_len, "cannot create the cache directory");
-        return nullptr;
-    }
+    rek_bt* bt = start_session(cache_dir, port, enable_dht, err, err_len);
+    if (!bt) return nullptr;
 
-    auto bt = std::make_unique<rek_bt>();
     bt->hash = parsed->info_hash;
-
-    Client::Config config;
-    config.listen_port   = port;
-    config.download_path = cache_dir;
-    bt->client = std::make_unique<Client>(config);
-
-    if (enable_dht) {
-        // A magnet has no peer list of its own beyond trackers, and a torrent
-        // with no trackers would never find anything: one DHT client, bootstrapped
-        // and handed to the session, is the peer source. Failure is not fatal —
-        // trackers and --connect peers still work.
-        bt->dht = std::make_unique<DhtClient>(0);
-        if (bt->dht->start()) {
-            bt->dht->bootstrap(DhtClient::get_default_bootstrap_nodes());
-            bt->client->set_external_dht(bt->dht.get());
-        }
-    }
-
-    bt->client->start();
     bt->torrent = bt->client->add_magnet(magnet, cache_dir);
     if (!bt->torrent) {
-        rek_bt_close(bt.release());
+        rek_bt_close(bt);
         set_error(err, err_len, "librats refused the magnet link");
         return nullptr;
     }
-    return bt.release();
+    return bt;
+}
+
+/// Mount the release a .torrent file describes. The metadata is in the file, so
+/// there is no BEP 9 wait and no swarm needed to browse it.
+rek_bt* rek_bt_open_torrent(const char* torrent_path, const char* cache_dir, uint16_t port,
+                            int enable_dht, char* err, size_t err_len) {
+    if (!torrent_path || !cache_dir) {
+        set_error(err, err_len, "a .torrent path and a cache directory are required");
+        return nullptr;
+    }
+
+    TorrentParseError parse_error;
+    auto info = TorrentInfo::from_file(torrent_path, &parse_error);
+    if (!info) {
+        // The parser's own message says more than an errno would ("missing info
+        // dictionary", "unexpected end of data"), so it is passed through — with
+        // the path, because the parser cannot know what the user typed.
+        char msg[512];
+        std::snprintf(msg, sizeof msg, "%s: %s", torrent_path,
+                      parse_error.message.empty() ? "not a readable .torrent" : parse_error.message.c_str());
+        set_error(err, err_len, msg);
+        return nullptr;
+    }
+
+    rek_bt* bt = start_session(cache_dir, port, enable_dht, err, err_len);
+    if (!bt) return nullptr;
+
+    bt->hash = info->info_hash();
+    bt->torrent = bt->client->add_torrent(*info, cache_dir);
+    if (!bt->torrent) {
+        rek_bt_close(bt);
+        set_error(err, err_len, "librats refused the torrent");
+        return nullptr;
+    }
+    return bt;
 }
 
 void rek_bt_close(rek_bt* bt) {

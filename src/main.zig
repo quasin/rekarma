@@ -79,10 +79,11 @@ fn run(init: std.process.Init) !void {
         return;
     }
 
-    // --magnet is a mode of its own: no room, no recording file, no node. It
-    // mounts a release through FUSE and reads it on demand, so everything below
-    // (log file, daemon fork, pubsub node) is wrong for it and is skipped.
-    if (opts.magnet) |uri| {
+    // --magnet and --torrent are one mode of their own: no room, no recording
+    // file, no node. They mount a release through FUSE and read it on demand, so
+    // everything below (log file, daemon fork, pubsub node) is wrong for them and
+    // is skipped. The only difference is where the metadata comes from.
+    if (opts.magnet orelse opts.torrent) |source| {
         try printBanner(out);
         c.rats_set_log_level(if (opts.verbose)
             @intCast(c.RATS_LOG_INFO)
@@ -112,7 +113,8 @@ fn run(init: std.process.Init) !void {
         for (opts.peers.items, 0..) |peer, i| peers[i] = .{ .host = peer.host, .port = peer.port };
 
         try magnet.run(io, gpa, out, .{
-            .magnet = uri,
+            .source = source,
+            .torrent = opts.torrent != null,
             .mount = opts.mount,
             .cache = opts.cache,
             .port = opts.port,
@@ -609,6 +611,11 @@ fn parseArgs(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
                 opts.problem = try std.fmt.allocPrint(gpa, "{s} needs a magnet link", .{name});
                 break :parse;
             };
+        } else if (std.mem.eql(u8, name, "--torrent")) {
+            opts.torrent = reader.value(attached) orelse {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} needs a .torrent file", .{name});
+                break :parse;
+            };
         } else if (std.mem.eql(u8, name, "-m") or std.mem.eql(u8, name, "--mount")) {
             opts.mount = reader.value(attached) orelse {
                 opts.problem = try std.fmt.allocPrint(gpa, "{s} needs a directory", .{name});
@@ -723,22 +730,28 @@ fn parseArgs(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
         if (opts.daemon and opts.show) {
             opts.problem = "--daemon and --show ask for opposite things: one stays up, the other prints and exits";
         }
-        // --magnet mounts a release: it is its own mode and owns the process,
-        // so room-style options that would run a second, unrelated job (a
-        // message, --stay, --daemon, --show, the room's file) are refused rather
-        // than silently ignored.
-        if (opts.magnet != null) {
-            if (opts.message.items.len != 0) {
-                opts.problem = "--magnet mounts a release; a message given with it would never be published";
+        // --magnet/--torrent mount a release: one mode that owns the process, so
+        // room-style options that would run a second, unrelated job (a message,
+        // --stay, --daemon, --show, the room's file) are refused rather than
+        // silently ignored. They also name the same release in two ways.
+        if (opts.magnet != null or opts.torrent != null) {
+            if (opts.magnet != null and opts.torrent != null) {
+                opts.problem = "--magnet and --torrent both name a release: give one of them";
+            } else if (opts.message.items.len != 0) {
+                opts.problem = "--magnet/--torrent mounts a release; a message given with it would never be published";
             } else if (opts.show) {
-                opts.problem = "--magnet mounts a release; --show prints the room's log instead";
+                opts.problem = "--magnet/--torrent mounts a release; --show prints the room's log instead";
             } else if (opts.stay) {
-                opts.problem = "--magnet already stays up for the whole mount; --stay is for the room";
-            } else if (opts.magnet.?.len == 0) {
-                opts.problem = "the magnet link cannot be empty";
-            } else if (!magnet.looksValid(opts.magnet.?)) {
-                opts.problem = "not a magnet link or info-hash: magnet:?xt=urn:btih:…, " ++
-                    "a 40-hex/32-base32 hash, or xt=urn:btih:… (quote it in the shell)";
+                opts.problem = "--magnet/--torrent already stays up for the whole mount; --stay is for the room";
+            } else if (opts.magnet) |link| {
+                if (link.len == 0) {
+                    opts.problem = "the magnet link cannot be empty";
+                } else if (!magnet.looksValid(link)) {
+                    opts.problem = "not a magnet link or info-hash: magnet:?xt=urn:btih:…, " ++
+                        "a 40-hex/32-base32 hash, or xt=urn:btih:… (quote it in the shell)";
+                }
+            } else if (opts.torrent.?.len == 0) {
+                opts.problem = "the .torrent path cannot be empty";
             }
         }
     }
@@ -824,6 +837,9 @@ const Options = struct {
     pid: ?[]const u8 = null,
     /// A magnet link: mount that release instead of recording a room.
     magnet: ?[]const u8 = null,
+    /// A .torrent file: mount the release it describes, with the metadata read
+    /// from disk instead of the swarm.
+    torrent: ?[]const u8 = null,
     /// Where the magnet's release is mounted; null = mnt/<torrent name>.
     mount: ?[]const u8 = null,
     /// Where the magnet's pieces are written and kept; null = .rekarma.
@@ -873,6 +889,9 @@ fn printUsage(out: *Io.Writer) !void {
         \\      --magnet <link>    mount the torrent a magnet link names; a bare
         \\                         info-hash or xt=urn:btih:… also works
         \\                         (quote the link: the shell eats ? and &)
+        \\      --torrent <file>   mount the release a .torrent file describes;
+        \\                         the metadata comes from the file, so browsing
+        \\                         it needs no peer at all
         \\  -m, --mount <dir>     where to mount it                [mnt/<name>]
         \\      --cache <dir>      where pieces are written and kept [.rekarma]
         \\                         browsing costs the metadata only; a file is
@@ -890,6 +909,7 @@ fn printUsage(out: *Io.Writer) !void {
         \\  rekarma --show                   print all.txt's last 1000 messages
         \\  rekarma --magnet "magnet:?xt=urn:btih:…"    mount a release at mnt/<name>
         \\  rekarma --magnet "magnet:?xt=urn:btih:…" -m /mnt/rel --cache /var/cache/rekarma
+        \\  rekarma --torrent ~/release.torrent -m /mnt/rel   mount from a file
         \\  ls /mnt/rel                     browse without downloading the release
         \\  mpv "/mnt/rel/<file>"           read one file as its pieces arrive
         \\

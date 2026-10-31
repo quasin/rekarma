@@ -6,15 +6,16 @@ Autonomi `ant-client` is installed by `install.sh` for later use. `main.zig`
 joins one librats pubsub room and records the last messages it carries into
 that room's file (`all.txt` by default), can publish a message handed to it on
 the command line, can run itself as a daemon recording the room in the
-background, and can mount a release named by a magnet link through FUSE 3 and
-serve its files on demand (`--magnet`).
+background, and can mount a release named by a magnet link or described by a
+`.torrent` file through FUSE 3 and serve its files on demand (`--magnet`,
+`--torrent`).
 
 ## Layout
 
     src/main.zig                  executable entry point: args, node, room loop, mode dispatch
     src/room_log.zig              the room's file — last N messages, in memory and on disk
     src/c.h                       every C #include the project needs, in one header
-    src/magnet.zig                --magnet: open the session, print the tree, run the mount
+    src/magnet.zig                --magnet/--torrent: open the session, print the tree, run the mount
     src/magnet_shim.cpp           C++ shim over librats' bittorrent client (metadata, pieces)
     src/magnet_tree.zig           metadata -> directory tree + torrent byte offsets (unit-tested)
     src/magnet_fs.zig             FUSE callbacks: getattr/readdir/open/read/release
@@ -100,13 +101,22 @@ messages over the DHT" as a code bug until this has been ruled out:
 Debug a layer at a time with `--no-mdns` / `--no-dht` / `--no-discovery`, and
 give a sender `--wait` if the DHT needs longer than its default 90 s.
 
-## Mounting a release (`--magnet`)
+## Mounting a release (`--magnet` / `--torrent`)
 
-- `--magnet <link>` is its own mode: no room, no log file, no node, no daemon
-  fork — it mounts a torrent read-only through FUSE 3 and serves reads on
-  demand. Room-style companions (`--daemon`, `--show`, `--stay`, a message) are
-  refused rather than ignored, and `--connect` peers are handed to the torrent as
-  well as to the node (the only way to wire a magnet with no trackers/DHT).
+- `--magnet <link>` and `--torrent <file>` are one mode: no room, no log file, no
+  node, no daemon fork — they mount a torrent read-only through FUSE 3 and serve
+  reads on demand. Room-style companions (`--daemon`, `--show`, `--stay`, a
+  message) are refused rather than ignored, and `--connect` peers are handed to
+  the torrent as well as to the node (the only way to wire a magnet with no
+  trackers/DHT). The two are mutually exclusive: they name the same release.
+- `--torrent` differs in one place only — where the info dict comes from. The
+  shim reads it with `TorrentInfo::from_file` and adds it with
+  `Client::add_torrent`, so there is no BEP 9 wait: browsing works with no peer
+  and no DHT, and the daemon's first read is the only thing that needs a swarm.
+  A parse failure is reported with the parser's own message and the path
+  (`<path>: unexpected end of data`), never as a bare errno.
+- Both entry points share `start_session()` in the shim (cache dir, client, DHT),
+  so a change to the node setup cannot reach one mode and miss the other.
 - The link may be a full `magnet:?…`, a bare 40-hex/32-base32 info-hash, or
   `xt=urn:btih:…`; `normalize_magnet()` in `magnet_shim.cpp` completes the last
   two. The shell eats `?` and `&`, so the usage text tells the user to quote it.
@@ -236,6 +246,7 @@ A mount needs a peer holding the torrent; two processes on one host are enough
 if one seeds. With any seeder's info-hash and listen port:
 
     rekarma --magnet <hash-or-magnet> -m /tmp/mnt --cache /tmp/cache -c 127.0.0.1:6900
+    rekarma --torrent release.torrent -m /tmp/mnt --cache /tmp/cache   # no peer needed to browse
     find /tmp/mnt -type f                 # tree from metadata, no payload fetched
     du -sh /tmp/cache                     # small: pieces are parked until read
     tail -c 64 "/tmp/mnt/<file>"          # fetches exactly that piece, then verifies
