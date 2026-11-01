@@ -125,10 +125,30 @@ static const struct fuse_operations rek_ops = {
  * session, then unmount. Blocks the calling thread; returns 0 or -errno.
  */
 int rek_fuse_run(const char* mountpoint, const char* fsname) {
+    /* FUSE parses -o as a comma-separated list, so a torrent name with a comma
+     * in it ("Klabnik S., Nichols C. …") split the fsname option in two and the
+     * mount died with "unknown option(s)" before a single read. fsname/subtype
+     * only name the filesystem in `mount` and `df`, so the name is rewritten
+     * instead of being refused: a release with a comma in its title is common
+     * and its mount is what the user asked for. */
+    char safe[256];
+    const char* source = fsname ? fsname : "rekarma";
+    size_t n = 0;
+    for (const unsigned char* p = (const unsigned char*)source; *p != '\0' && n + 1 < sizeof(safe); p++) {
+        unsigned char c = *p;
+        if (c < 0x20 || c == 0x7f) continue;
+        safe[n++] = (c == ',' || c == '\\' || c == '"' || c == '\'') ? '_' : (char)c;
+    }
+    if (n == 0) {
+        memcpy(safe, "rekarma", 7);
+        n = 7;
+    }
+    safe[n] = '\0';
+
     char options[512];
     snprintf(options, sizeof(options),
              "ro,fsname=%s,subtype=%s,default_permissions,auto_unmount",
-             fsname ? fsname : "rekarma", fsname ? fsname : "rekarma");
+             safe, safe);
 
     char* argv[] = {(char*)"rekarma", (char*)"-o", options, NULL};
     struct fuse_args args = FUSE_ARGS_INIT(3, argv);

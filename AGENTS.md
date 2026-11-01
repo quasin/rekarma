@@ -179,6 +179,14 @@ give a sender `--wait` if the DHT needs longer than its default 90 s.
 - `src/fuse_glue.c` owns every FUSE type (`struct fuse_operations`, `struct stat`,
   `fuse_loop_cfg_*`, `FUSE_USE_VERSION 312`); the Zig side sees only paths, sizes
   and byte buffers. Do not translate `fuse.h` into Zig just to remove this file.
+- **The torrent name is a FUSE `-o` value, so it is sanitized before it is
+  used.** `-o ro,fsname=<name>,subtype=<name>,…` is one comma-separated list:
+  a release titled "Klabnik S., Nichols C. … - The Rust Programming Language,
+  3rd Edition" split the option in two, and the mount died with `fuse: unknown
+  option(s)` right after printing `mounted` — filesystem and cache files were
+  never served. `rek_fuse_run` now rewrites `, \ " '` to `_` and drops control
+  bytes in `fsname`/`subtype` (which only name the fs in `mount` and `df`), so
+  the mount succeeds and the release keeps its real title inside the mount.
 
 ## Hard constraints
 
