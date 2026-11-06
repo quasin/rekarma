@@ -61,6 +61,21 @@ pub const Params = struct {
     port: u16 = 0,
     dht: bool = true,
     peers: []const Peer = &.{},
+    /// Bytes the cache may occupy; null = auto (60% of the free space on the
+    /// cache's filesystem), 0 = keep everything that was read, for ever.
+    cache_limit: ?u64 = null,
+    /// Read-ahead per waiting read, in bytes; null = the engine's 128 MiB.
+    prefetch: ?u64 = null,
+    /// FUSE worker threads; 0 = the glue's default (32). A read blocks until its
+    /// pieces arrive, so readers want more than one, but a 1-core box does not
+    /// want 32 threads competing for it.
+    fuse_threads: u32 = 0,
+};
+
+/// The engine's per-mount budget (src/magnet_shim.cpp rek_bt_config).
+const BtConfig = extern struct {
+    cache_limit: u64,
+    prefetch: u64,
 };
 
 /// The shim's C ABI (src/magnet_shim.cpp). The file list is borrowed from the
@@ -77,9 +92,12 @@ const BtProgress = extern struct {
     progress: f64,
 };
 
-extern fn rek_bt_open(magnet: [*:0]const u8, cache: [*:0]const u8, port: u16, dht: c_int, err: [*]u8, err_len: usize) ?*anyopaque;
-extern fn rek_bt_open_torrent(path: [*:0]const u8, cache: [*:0]const u8, port: u16, dht: c_int, err: [*]u8, err_len: usize) ?*anyopaque;
+extern fn rek_bt_open(magnet: [*:0]const u8, cache: [*:0]const u8, port: u16, dht: c_int, config: ?*const BtConfig, err: [*]u8, err_len: usize) ?*anyopaque;
+extern fn rek_bt_open_torrent(path: [*:0]const u8, cache: [*:0]const u8, port: u16, dht: c_int, config: ?*const BtConfig, err: [*]u8, err_len: usize) ?*anyopaque;
 extern fn rek_bt_close(handle: ?*anyopaque) void;
+extern fn rek_bt_cache_limit(handle: ?*anyopaque) u64;
+extern fn rek_bt_cache_bytes(handle: ?*anyopaque) u64;
+extern fn rek_bt_free_bytes(path: [*:0]const u8) u64;
 extern fn rek_bt_tracker_count(handle: ?*anyopaque) usize;
 extern fn rek_bt_tracker_url(handle: ?*anyopaque, index: usize, buf: [*]u8, len: usize) usize;
 extern fn rek_bt_identity(handle: ?*anyopaque, info_hash_hex: [*]u8, peer_id_hex: [*]u8, len: usize) void;
@@ -103,10 +121,17 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, params: Params) !voi
 
     // Zeroed so a failure with an empty message still prints something sane.
     var err_buf: [256]u8 = @splat(0);
+    const budget = cacheBudget(cache_z.ptr, params.cache_limit);
+    var config: BtConfig = .{
+        .cache_limit = budget.limit,
+        // 0 = the engine's own 128 MiB: the window is a property of a reader, not
+        // of the disk, so it is only overridden when asked for.
+        .prefetch = params.prefetch orelse 0,
+    };
     const opened = if (params.torrent)
-        rek_bt_open_torrent(source_z.ptr, cache_z.ptr, params.port, @intFromBool(params.dht), &err_buf, err_buf.len)
+        rek_bt_open_torrent(source_z.ptr, cache_z.ptr, params.port, @intFromBool(params.dht), &config, &err_buf, err_buf.len)
     else
-        rek_bt_open(source_z.ptr, cache_z.ptr, params.port, @intFromBool(params.dht), &err_buf, err_buf.len);
+        rek_bt_open(source_z.ptr, cache_z.ptr, params.port, @intFromBool(params.dht), &config, &err_buf, err_buf.len);
     const handle = opened orelse {
         try out.print("rekarma: {s}\n", .{std.mem.sliceTo(&err_buf, 0)});
         try out.flush();
@@ -122,7 +147,15 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, params: Params) !voi
         rek_bt_add_peer(handle, host_z.ptr, peer.port);
     }
 
-    try out.print("cache    {s}\n", .{cache});
+    if (budget.limit == 0) {
+        try out.print("cache    {s} (no limit: everything read stays on disk)\n", .{cache});
+    } else if (params.cache_limit != null) {
+        try out.print("cache    {s} (limit {f})\n", .{ cache, humanSize(budget.limit) });
+    } else {
+        try out.print("cache    {s} (limit {f}, 60% of {f} free)\n", .{
+            cache, humanSize(budget.limit), humanSize(budget.free),
+        });
+    }
     if (params.torrent) {
         // The metadata is in the file: there is nothing to wait for but the
         // one poll below, which is why this mode also works with no peers.
@@ -191,9 +224,13 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, params: Params) !voi
     fs.mount(&tree);
     try out.print("\nmounted  {s} (read-only, open files read on demand)\n", .{mountpoint});
     try out.print("         nothing is downloaded until a file is read; unmount with umount or Ctrl-C\n", .{});
+    if (budget.limit != 0) {
+        try out.print("         the cache drops pieces nobody read recently once it passes {f};\n", .{humanSize(budget.limit)});
+        try out.print("         reading one of those again downloads it again\n", .{});
+    }
     try out.flush();
 
-    const rc = fs.run(mount_z, name_z);
+    const rc = fs.run(mount_z, name_z, params.fuse_threads);
     fs.unmount();
 
     // Tell an https tracker we are gone, so it does not hold the peer slot (and
@@ -205,6 +242,11 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, params: Params) !voi
     try out.print("\nunmounted {s} — {f} of {f} fetched ({d:.1}%), {d} peer(s)\n", .{
         mountpoint, humanSize(state.downloaded), humanSize(state.total_size), state.progress * 100.0, state.peers,
     });
+    if (budget.limit != 0) {
+        try out.print("cache    {f} kept on disk (limit {f})\n", .{
+            humanSize(rek_bt_cache_bytes(handle)), humanSize(budget.limit),
+        });
+    }
     if (rc != 0) try out.print("rekarma: the mount ended with an error ({d})\n", .{rc});
     try out.flush();
 }
@@ -324,6 +366,20 @@ fn printTree(out: *Io.Writer, tree: *tree_mod.Tree) !void {
 
 fn humanSize(bytes: u64) HumanSize {
     return .{ .bytes = bytes };
+}
+
+/// The cache budget this mount runs under: whatever --cache-limit said, or 60 %
+/// of what is free on the cache's own filesystem. The limit has to follow the
+/// disk the pieces land on, so the same binary behaves sanely on a 10 GB VPS and
+/// on a 2 TB desktop without a flag for either.
+fn cacheBudget(cache: [*:0]const u8, requested: ?u64) struct { limit: u64, free: u64 } {
+    const free = rek_bt_free_bytes(cache);
+    if (requested) |bytes| return .{ .limit = bytes, .free = free };
+    if (free == 0) return .{ .limit = 0, .free = 0 };
+    // Never the whole disk: the mount tree, the logs and the rest of the machine
+    // live on it too, and a cache that fills the disk turns into a stalled read —
+    // the write fails, and the read that needed it waits out its timeout.
+    return .{ .limit = free / 5 * 3, .free = free };
 }
 
 /// Prints as "12.3 MB" through the formatter, so every caller gets the same

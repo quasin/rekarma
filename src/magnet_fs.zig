@@ -68,11 +68,12 @@ extern fn rek_fuse_dir_entry(buf: ?*anyopaque, filler: ?*const anyopaque, name: 
 
 /// Mount @p mountpoint and serve it until a signal or an error ends the
 /// session. Blocks the calling thread. Returns 0 or a negative errno.
-pub fn run(mountpoint: [:0]const u8, fsname: [:0]const u8) c_int {
-    return rek_fuse_run(mountpoint.ptr, fsname.ptr);
+/// @p threads 0 = the default worker count.
+pub fn run(mountpoint: [:0]const u8, fsname: [:0]const u8, threads: u32) c_int {
+    return rek_fuse_run(mountpoint.ptr, fsname.ptr, @intCast(@min(threads, 128)));
 }
 
-extern fn rek_fuse_run(mountpoint: [*:0]const u8, fsname: [*:0]const u8) c_int;
+extern fn rek_fuse_run(mountpoint: [*:0]const u8, fsname: [*:0]const u8, threads: c_int) c_int;
 
 fn dirEntry(buf: ?*anyopaque, filler: ?*const anyopaque, name: []const u8, is_dir: bool, size: u64) c_int {
     return rek_fuse_dir_entry(buf, filler, name.ptr, name.len, @intFromBool(is_dir), size, 0);

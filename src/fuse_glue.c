@@ -124,7 +124,7 @@ static const struct fuse_operations rek_ops = {
  * Mount at @p mountpoint, serve requests until a signal or an error stops the
  * session, then unmount. Blocks the calling thread; returns 0 or -errno.
  */
-int rek_fuse_run(const char* mountpoint, const char* fsname) {
+int rek_fuse_run(const char* mountpoint, const char* fsname, int threads) {
     /* FUSE parses -o as a comma-separated list, so a torrent name with a comma
      * in it ("Klabnik S., Nichols C. …") split the fsname option in two and the
      * mount died with "unknown option(s)" before a single read. fsname/subtype
@@ -178,8 +178,13 @@ int rek_fuse_run(const char* mountpoint, const char* fsname) {
     /* Many worker threads: a read blocks until its pieces arrive, and a player
        keeps several reads in flight (readahead plus its own buffers). With too
        few workers the requests behind them — including the lookups another
-       program does — queue behind a wait they did not ask for. */
-    fuse_loop_cfg_set_max_threads(loop, 32);
+       program does — queue behind a wait they did not ask for.
+       --fuse-threads exists for the other end of that trade: on a 1-core box the
+       same 32 threads are 32 waiters competing for one core, and every one of
+       them costs 8 MB of address space. */
+    if (threads <= 0) threads = 32;
+    if (threads > 128) threads = 128;
+    fuse_loop_cfg_set_max_threads(loop, (unsigned)threads);
 
     int rc = fuse_loop_mt(fuse, loop);
     // A loop stopped by SIGINT/SIGTERM (or by umount) is the normal way this

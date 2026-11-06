@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <future>
@@ -46,8 +47,20 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+
+// Disk-side eviction: FALLOC_FL_PUNCH_HOLE frees a piece's blocks without
+// changing the file's size, and statvfs is what "cache limit auto" is computed
+// from. Both come from the kernel headers directly — a `-std=c++11` build has no
+// _GNU_SOURCE, so fallocate()/statvfs() would not be declared.
+#include <fcntl.h>
+#include <linux/falloc.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #define private public
 #include <librats/bittorrent/client.h>
@@ -85,6 +98,20 @@ struct rek_bt_progress {
     double   progress;
 };
 
+/// What a mount may spend on the host it runs on. Fixed at open time: the limit
+/// is enforced by the eviction pass in rek_bt_read, and the window is read by
+/// every pump_range.
+///
+/// `cache_limit` 0 means unbounded — the historical behaviour, where the cache
+/// grows to whatever was read and never shrinks. Anything else is a hard cap:
+/// cold pieces are dropped from disk and re-fetched when somebody reads them
+/// again, which is what lets a 10 GB machine mount a 2 TB release. `prefetch` 0
+/// means the built-in 128 MiB read-ahead.
+struct rek_bt_config {
+    uint64_t cache_limit;
+    uint64_t prefetch;
+};
+
 struct rek_bt {
     std::unique_ptr<Client>    client;
     std::unique_ptr<DhtClient> dht;
@@ -94,11 +121,29 @@ struct rek_bt {
     DiskIo*                    disk    = nullptr;
 
     std::string              name;
+    std::string              cache_root; /* the directory pieces are written to */
     std::vector<std::string> paths;   /* storage for rek_bt_file::path */
     std::vector<rek_bt_file> files;
     uint32_t                 piece_length = 0;
     uint32_t                 num_pieces   = 0;
     uint64_t                 total_size   = 0;
+
+    /* Cache budget in bytes: kept under `cache_limit`, evicted down to
+       `cache_target` (a little below it, so one read does not evict exactly one
+       piece's worth and immediately refill it). 0 = unbounded. */
+    uint64_t cache_limit  = 0;
+    uint64_t cache_target = 0;
+    /// Read-ahead per active window, in bytes (0 = kPrefetchBytes).
+    uint64_t prefetch_bytes = 0;
+    /// Where the next eviction pass starts looking. A rotating cursor instead of
+    /// a scan from piece 0 keeps eviction as cheap on a 500 000-piece torrent as
+    /// on a 50-piece one.
+    uint32_t evict_cursor = 0;
+    /// Last measured on-disk footprint of the cache and when it was measured:
+    /// statting every file of the release on every read would cost more than the
+    /// read itself, so the number is sampled a few times a second.
+    uint64_t cache_bytes = 0;
+    std::chrono::steady_clock::time_point cache_bytes_at{};
 
     struct Range {
         uint32_t first;
@@ -117,6 +162,13 @@ struct rek_bt {
 
     /// The one piece left Wanted outside the windows (see pump_range).
     uint32_t keepalive = 0;
+
+    /* Pieces a read has touched recently, so a player's re-read of the same
+       block is not evicted between its own reads. Bounded: this bookkeeping must
+       not grow with the torrent. */
+    std::mutex                   recent_mutex;
+    std::deque<uint32_t>         recent;
+    std::unordered_set<uint32_t> recent_set;
 };
 
 void rek_bt_close(rek_bt* bt);
@@ -185,6 +237,329 @@ constexpr uint64_t kPrefetchBytes = 128ull * 1024 * 1024;
 /// every step, throwing the work away and stalling the reader on its retry.
 constexpr uint32_t kKeepBehindPieces = 4;
 
+/// How many recently-read pieces are remembered (see rek_bt::recent): enough for
+/// a player's re-reads, small enough that the bookkeeping is a rounding error on
+/// a 1 GB machine.
+constexpr size_t kRecentPieces = 4096;
+
+/// How much of the budget the recent ring may protect. Never more than a quarter:
+/// a ring that covered the whole cache would leave nothing evictable and the limit
+/// could not be enforced at all.
+size_t recent_limit(const rek_bt& bt) {
+    if (bt.cache_limit == 0 || bt.piece_length == 0) return kRecentPieces;
+    const uint64_t by_bytes = std::max<uint64_t>(64, bt.cache_limit / 4 / bt.piece_length);
+    return size_t(std::min<uint64_t>(kRecentPieces, by_bytes));
+}
+
+/// REKARMA_EVICT_DEBUG=1 makes the eviction pass say what it sees. Off by
+/// default; read once, so a read pays a branch instead of a getenv.
+bool evict_debug() {
+    static const bool on = std::getenv("REKARMA_EVICT_DEBUG") != nullptr;
+    return on;
+}
+
+/// The read-ahead this session actually uses: --prefetch, or the built-in value.
+uint64_t window_ahead(const rek_bt& bt) {
+    return bt.prefetch_bytes ? bt.prefetch_bytes : kPrefetchBytes;
+}
+
+/// The union of every waiting read's window, as piece ranges. Shared by
+/// pump_range (what to fetch) and by the eviction pass (what must not be dropped
+/// under a reader that is still waiting for it) — one definition, so the two can
+/// never disagree about what is "in use".
+std::vector<rek_bt::Range> active_windows(rek_bt& bt) {
+    std::vector<rek_bt::Range> windows;
+    if (bt.num_pieces == 0 || bt.piece_length == 0) return windows;
+    const uint32_t last_piece = bt.num_pieces - 1;
+    const uint64_t ahead      = window_ahead(bt);
+
+    std::lock_guard<std::mutex> lock(bt.active_mutex);
+    windows.reserve(bt.active.size());
+    for (const rek_bt::Range& range : bt.active) {
+        if (range.first > last_piece) continue;
+        const std::uint64_t end_byte =
+            (std::min(range.last, last_piece) + 1ull) * bt.piece_length + ahead;
+        const uint32_t window_last = static_cast<uint32_t>(
+            std::min<std::uint64_t>(last_piece, end_byte / bt.piece_length));
+        windows.push_back(rek_bt::Range{
+            range.first > kKeepBehindPieces ? range.first - kKeepBehindPieces : 0,
+            window_last,
+        });
+    }
+    return windows;
+}
+
+bool in_any_window(const std::vector<rek_bt::Range>& windows, uint32_t piece) {
+    for (const rek_bt::Range& window : windows)
+        if (piece >= window.first && piece <= window.last) return true;
+    return false;
+}
+
+bool is_recent(rek_bt& bt, uint32_t piece) {
+    std::lock_guard<std::mutex> lock(bt.recent_mutex);
+    return bt.recent_set.count(piece) != 0;
+}
+
+/// Remember the pieces of a read that just completed, so the next read of the
+/// same block (a player re-reading, a second pass over a page) finds them on disk
+/// instead of triggering a download. A range longer than the ring keeps its tail:
+/// that is the part the reader is closest to.
+void note_recent(rek_bt& bt, uint32_t first, uint32_t last) {
+    if (last < first) return;
+    if (uint64_t(last) - first + 1 > kRecentPieces) first = last - uint32_t(kRecentPieces - 1);
+
+    std::lock_guard<std::mutex> lock(bt.recent_mutex);
+    const size_t keep = recent_limit(bt);
+    for (uint32_t piece = first;; ++piece) {
+        if (bt.recent_set.insert(piece).second) {
+            bt.recent.push_back(piece);
+            while (bt.recent.size() > keep) {
+                bt.recent_set.erase(bt.recent.front());
+                bt.recent.pop_front();
+            }
+        }
+        if (piece == last) break;
+    }
+}
+
+/// Free the blocks of [offset, offset+length) of @p path without changing the
+/// file's size: the tree the mount exposes and the lengths the disk layer
+/// recorded both stay right, only the bytes stop occupying the SSD.
+bool punch_hole(const std::string& path, uint64_t offset, uint64_t length) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (evict_debug())
+            std::fprintf(stderr, "punch: open %s failed: %s\n", path.c_str(), std::strerror(errno));
+        return false;
+    }
+    // fallocate() itself is not declared without _GNU_SOURCE, so the syscall is
+    // made directly; the flag values come from <linux/falloc.h>.
+    const long rc = ::syscall(SYS_fallocate, fd,
+                              int(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE),
+                              (long long)offset, (long long)length);
+    const int err = rc == 0 ? 0 : errno;
+    ::close(fd);
+    if (evict_debug())
+        std::fprintf(stderr, "punch: %s @%llu+%llu rc=%ld err=%d\n", path.c_str(),
+                     (unsigned long long)offset, (unsigned long long)length, rc, err);
+    if (err != 0 && err != EOPNOTSUPP && err != ENOSYS && err != ENOTSUP) {
+        std::fprintf(stderr, "rekarma: cannot free %llu bytes of %s: %s\n",
+                     (unsigned long long)length, path.c_str(), std::strerror(err));
+    }
+    return err == 0;
+}
+
+/// Cut one piece's bytes out of the cache files that cover it. @c bt.files is
+/// ordered by offset (FileStorage lays files end-to-end), so the pieces that
+/// overlap are found by a binary search rather than by walking the release.
+void punch_piece(rek_bt& bt, uint32_t piece) {
+    if (!bt.picker || bt.files.empty()) return;
+    const uint64_t start = uint64_t(piece) * bt.piece_length;
+    const uint64_t end   = start + bt.picker->piece_size(piece);
+
+    auto it = std::upper_bound(bt.files.begin(), bt.files.end(), start,
+                               [](uint64_t value, const rek_bt_file& f) {
+                                   return value < uint64_t(f.offset);
+                               });
+    if (it != bt.files.begin()) --it;
+
+    for (; it != bt.files.end() && uint64_t(it->offset) < end; ++it) {
+        const uint64_t file_start = uint64_t(it->offset);
+        const uint64_t file_end   = file_start + uint64_t(it->size);
+        const uint64_t from = std::max(start, file_start);
+        const uint64_t to   = std::min(end, file_end);
+        if (to <= from) continue;
+        punch_hole(bt.cache_root + "/" + it->path, from - file_start, to - from);
+    }
+}
+
+/// The inverse of PiecePicker::we_have (piece_picker.cpp): the bytes are gone
+/// from the cache, so the piece leaves `have_` and — while it is still wanted —
+/// goes back into the rarest-first index. That is what makes the next read of it
+/// wait for a real download instead of reading zeros out of the hole.
+///
+/// Reactor thread only, like every other picker mutation: the fields below are
+/// the ones we_have() touches, and the class is single-threaded by design.
+void forget_piece(rek_bt& bt, uint32_t piece) {
+    PiecePicker& picker = *bt.picker;
+    if (piece >= picker.num_pieces_ || !picker.have_.get(piece)) return;
+
+    picker.have_.reset(piece);
+    if (picker.num_have_ > 0) --picker.num_have_;
+    if (picker.seq_cursor_ > piece) picker.seq_cursor_ = piece;
+    picker.downloading_.erase(piece);
+
+    // Undo what we_have() accounted for, then make the piece cold. A forgotten
+    // piece that kept its High priority would be requested again immediately, by
+    // the picker, with nobody reading it — eviction that never frees anything.
+    // DontDownload is what pump_range overrides when a reader comes back.
+    if (picker.priority_[piece] != PiecePriority::DontDownload) ++picker.pieces_left_;
+    picker.set_piece_priority(piece, PiecePriority::DontDownload);
+
+    // `left` in a tracker announce and the progress line come from these bytes,
+    // not from the bitfield: without the subtraction a release read through a
+    // capped cache would keep announcing 100 % while holding a few MB.
+    const uint64_t size = picker.piece_size(piece);
+    bt.torrent->verified_bytes_ =
+        bt.torrent->verified_bytes_ > size ? bt.torrent->verified_bytes_ - size : 0;
+    if (bt.torrent->state_ == Torrent::State::Seeding) bt.torrent->state_ = Torrent::State::Downloading;
+}
+
+/// Bytes the cache files occupy on disk: st_blocks, so a sparse region and a
+/// punched hole cost nothing. This is the only number that matches what the
+/// user's `df` and `du` will show, and the one a limit has to be enforced against
+/// — `have_ * piece_length` counts the pieces the engine kept and misses the
+/// blocks of the pieces it abandoned half-downloaded.
+///
+/// One stat per file, so it is only taken when the gate below says the pass is
+/// due, never per read.
+uint64_t allocated_bytes(const rek_bt& bt) {
+    uint64_t total = 0;
+    for (const rek_bt_file& file : bt.files) {
+        struct stat st;
+        if (::stat((bt.cache_root + "/" + file.path).c_str(), &st) == 0)
+            total += uint64_t(st.st_blocks) * 512;
+    }
+    return total;
+}
+
+/// REKARMA_EVICT_DEBUG=1: classify the pieces that actually hold bytes on disk,
+/// so a cache that stays over its limit says which kind of piece is holding it.
+/// Walks the real extents (SEEK_DATA/SEEK_HOLE), never the picker's opinion.
+void dump_cache_state(rek_bt& bt) {
+    if (!evict_debug() || bt.files.empty()) return;
+    static auto last = std::chrono::steady_clock::now() - std::chrono::seconds(5);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(1)) return;
+    last = now;
+
+    unsigned have = 0, high = 0, normal = 0, parked = 0, busy = 0;
+    for (const rek_bt_file& file : bt.files) {
+        const std::string path = bt.cache_root + "/" + file.path;
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+        const int64_t size = file.size;
+        int64_t off = 0;
+        while (off < size) {
+            const off_t data = ::lseek(fd, off, SEEK_DATA);
+            if (data < 0) break;
+            const off_t hole = ::lseek(fd, data, SEEK_HOLE);
+            const int64_t end = hole < 0 ? size : std::min<int64_t>(hole, size);
+            for (int64_t pos = data; pos < end; pos += bt.piece_length) {
+                const uint32_t piece = uint32_t((uint64_t(file.offset) + uint64_t(pos)) / bt.piece_length);
+                if (bt.picker->have_piece(piece)) { ++have; continue; }
+                if (bt.picker->downloading_.find(piece) != bt.picker->downloading_.end()) { ++busy; continue; }
+                switch (bt.picker->piece_priority(piece)) {
+                    case PiecePriority::High: ++high; break;
+                    case PiecePriority::Normal: ++normal; break;
+                    default: ++parked; break;
+                }
+            }
+            off = end;
+        }
+        ::close(fd);
+    }
+    std::fprintf(stderr, "cache state: have %u, high %u, normal %u, parked %u, downloading %u\n",
+                 have, high, normal, parked, busy);
+}
+
+/// Bring the cache back under its limit, measured.
+///
+/// Two kinds of bytes are in the cache and both count against the limit:
+///
+///   - pieces the picker has (`have_`), which a re-read of the same block wants;
+///   - blocks written for pieces that were abandoned half-downloaded when their
+///     window went away. Those are garbage — pump_range parks the piece as
+///     DontDownload, so nothing will ever complete them — and they are why a
+///     cache measured in `have_ * piece_length` alone grows past its limit.
+///
+/// Nothing here is estimated. A pass punches candidates and then stats the cache
+/// files: `st_blocks` is the only number that matches what the user's `df` says,
+/// and an eviction pass that trusts its own arithmetic keeps "freeing" pieces
+/// that are already holes while the real data further along is never reached.
+///
+/// The pass runs on the reactor right after a read handed its bytes out. A piece
+/// is forgotten and its hole punched in the same callback: refill() is the only
+/// thing that can ask a peer for a piece and it runs on this thread too, so
+/// nothing can re-download a piece between the two, and no reader can ever see a
+/// hole that `have_` still claims is data.
+void evict_to_limit(rek_bt& bt) {
+    if (bt.cache_limit == 0 || !bt.picker || bt.piece_length == 0 || bt.num_pieces == 0) return;
+    if (bt.files.empty()) return;
+
+    // Statting the release's files is cheap once and wasteful per read, so the
+    // number is sampled: at most a few times a second. Between samples the cache
+    // can overshoot by what the swarm delivers in that time.
+    const auto now = std::chrono::steady_clock::now();
+    const bool due = bt.cache_bytes_at == std::chrono::steady_clock::time_point{} ||
+                     now - bt.cache_bytes_at >= std::chrono::milliseconds(250);
+    if (!due) return;
+    bt.cache_bytes_at = now;
+    bt.cache_bytes    = allocated_bytes(bt);
+    if (bt.cache_bytes <= bt.cache_limit) return;
+
+    const uint64_t need  = bt.cache_bytes - bt.cache_target;
+    const uint32_t total = bt.num_pieces;
+    // How many candidates a pass may look at: enough to cover what has to go,
+    // with slack for the pieces that turn out to be holes already. Capped, so a
+    // read on a 500 000-piece torrent cannot turn into a full scan.
+    uint64_t wanted = need / bt.piece_length + 64;
+    const uint32_t budget = static_cast<uint32_t>(std::min<uint64_t>(wanted, std::min<uint32_t>(total, 65536)));
+
+    on_reactor(*bt.client, [&] {
+        const std::vector<rek_bt::Range> windows = active_windows(bt);
+
+        // Pass 1 — the pieces the engine kept. These are the ones a reader may
+        // want again, so the recently-read ones go last, and they are the only
+        // ones whose removal has to be told to the picker.
+        uint32_t cold = 0, looked = 0;
+        while (cold < budget && looked < budget * 4) {
+            const uint32_t piece = bt.evict_cursor;
+            bt.evict_cursor = (piece + 1) % total;
+            ++looked;
+            if (!bt.picker->have_piece(piece)) continue;
+            if (in_any_window(windows, piece)) continue;
+            if (is_recent(bt, piece)) continue;
+            forget_piece(bt, piece);
+            punch_piece(bt, piece);
+            ++cold;
+        }
+
+        // Pass 2 — leftovers with no `have_` bit that pump_range has parked:
+        // nothing will ever complete them, so every byte they hold is garbage.
+        // Block progress is no reason to keep it — librats re-creates a progress
+        // entry when a peer finally answers a request for a window that has since
+        // closed, and that residue is exactly what makes a cache measured only by
+        // `have_` grow past its limit. The entry is dropped with the bytes; the
+        // piece is fetched in full again if a reader ever comes back to it.
+        uint32_t orphans = 0;
+        uint64_t measured = allocated_bytes(bt);
+        if (measured > bt.cache_target) {
+            uint32_t seen = 0;
+            while (orphans < budget / 2 && seen < budget * 2) {
+                const uint32_t piece = bt.evict_cursor;
+                bt.evict_cursor = (piece + 1) % total;
+                ++seen;
+                if (bt.picker->have_piece(piece)) continue;
+                if (in_any_window(windows, piece)) continue;
+                if (bt.picker->piece_priority(piece) != PiecePriority::DontDownload) continue;
+                bt.picker->downloading_.erase(piece);
+                punch_piece(bt, piece);
+                ++orphans;
+            }
+            measured = allocated_bytes(bt);
+        }
+
+        bt.cache_bytes = measured;
+        dump_cache_state(bt);
+        if (evict_debug())
+            std::fprintf(stderr, "evict: %u cold (%u looked) + %u orphan punched, cache %llu of %llu\n",
+                         cold, looked, orphans, (unsigned long long)bt.cache_bytes,
+                         (unsigned long long)bt.cache_limit);
+    });
+}
+
+
 /// Ask the picker how many pieces of [first, last] are still missing, and make
 /// the swarm work on exactly the neighbourhood of that range: High for the
 /// range plus kPrefetchPieces ahead, DontDownload for everything else that is
@@ -204,28 +579,10 @@ uint32_t pump_range(rek_bt& bt, uint32_t first, uint32_t last) {
         // A window per waiting read: a seek starts a second read while the first
         // is still blocked, and dropping the first one's pieces (what a single
         // "current window" would do) leaves that read waiting out its timeout —
-        // which is exactly "playback stops after seeking".
-        std::vector<rek_bt::Range> windows;
-        {
-            std::lock_guard<std::mutex> lock(bt.active_mutex);
-            windows.reserve(bt.active.size());
-            for (const rek_bt::Range& range : bt.active) {
-                if (range.first > last_piece) continue;
-                const std::uint64_t end_byte =
-                    (std::min(range.last, last_piece) + 1ull) * bt.piece_length + kPrefetchBytes;
-                const uint32_t window_last = static_cast<uint32_t>(
-                    std::min<std::uint64_t>(last_piece, end_byte / bt.piece_length));
-                windows.push_back(rek_bt::Range{
-                    range.first > kKeepBehindPieces ? range.first - kKeepBehindPieces : 0,
-                    window_last,
-                });
-            }
-        }
-        auto in_window = [&](uint32_t piece) {
-            for (const rek_bt::Range& window : windows)
-                if (piece >= window.first && piece <= window.last) return true;
-            return false;
-        };
+        // which is exactly "playback stops after seeking". The eviction pass uses
+        // the same list, so what a read is waiting for is never dropped under it.
+        const std::vector<rek_bt::Range> windows = active_windows(bt);
+        auto in_window = [&](uint32_t piece) { return in_any_window(windows, piece); };
 
         // Only pieces that left every window are dropped, and only the ones that
         // are not already here: no rescan of all pieces per read, which at 30 000
@@ -317,7 +674,8 @@ std::string normalize_magnet(const std::string& input) {
 /// Everything the magnet and the .torrent entry points share: the cache
 /// directory, the client and its DHT. What differs between them is only how the
 /// info dict is obtained — read from the file, or fetched from peers (BEP 9).
-rek_bt* start_session(const char* cache_dir, uint16_t port, int enable_dht, char* err, size_t err_len) {
+rek_bt* start_session(const char* cache_dir, uint16_t port, int enable_dht, const rek_bt_config* cfg,
+                      char* err, size_t err_len) {
     std::error_code ec;
     std::filesystem::create_directories(cache_dir, ec);
     if (ec) {
@@ -331,6 +689,28 @@ rek_bt* start_session(const char* cache_dir, uint16_t port, int enable_dht, char
     config.listen_port   = port;
     config.download_path = cache_dir;
     bt->client = std::make_unique<Client>(config);
+
+    // The cache budget. A limit below 32 MiB would evict faster than a read can
+    // fetch, and a target at the limit itself would evict one piece per read for
+    // ever, so it is held a tenth below the cap: a single pass makes room for the
+    // next few reads instead of exactly one.
+    bt->cache_root     = cache_dir;
+    bt->cache_limit    = cfg ? cfg->cache_limit : 0;
+    bt->prefetch_bytes = cfg ? cfg->prefetch : 0;
+    if (bt->cache_limit != 0) {
+        constexpr uint64_t kMinLimit = 32ull * 1024 * 1024;
+        if (bt->cache_limit < kMinLimit) bt->cache_limit = kMinLimit;
+        bt->cache_target = bt->cache_limit - bt->cache_limit / 10;
+
+        // A window that is a large share of the budget is wasted budget: what a
+        // read does not get to is downloaded, abandoned and punched again. The
+        // read-ahead is therefore held to a sixteenth of the cache, which leaves
+        // the default 128 MiB untouched on any cache of 2 GB or more and keeps a
+        // deliberately tiny cache (a test, a 200 MB container) usable.
+        const uint64_t room = std::max<uint64_t>(1024 * 1024, bt->cache_limit / 16);
+        const uint64_t ahead = bt->prefetch_bytes ? bt->prefetch_bytes : kPrefetchBytes;
+        bt->prefetch_bytes = std::min(ahead, room);
+    }
 
     // A magnet has no peer list of its own beyond trackers, and a torrent with
     // no trackers would never find anything: one DHT client, bootstrapped and
@@ -353,7 +733,7 @@ rek_bt* start_session(const char* cache_dir, uint16_t port, int enable_dht, char
 extern "C" {
 
 rek_bt* rek_bt_open(const char* magnet_uri, const char* cache_dir, uint16_t port, int enable_dht,
-                    char* err, size_t err_len) {
+                    const rek_bt_config* cfg, char* err, size_t err_len) {
     if (!magnet_uri || !cache_dir) {
         set_error(err, err_len, "a magnet link and a cache directory are required");
         return nullptr;
@@ -369,7 +749,7 @@ rek_bt* rek_bt_open(const char* magnet_uri, const char* cache_dir, uint16_t port
         return nullptr;
     }
 
-    rek_bt* bt = start_session(cache_dir, port, enable_dht, err, err_len);
+    rek_bt* bt = start_session(cache_dir, port, enable_dht, cfg, err, err_len);
     if (!bt) return nullptr;
 
     bt->hash = parsed->info_hash;
@@ -385,7 +765,7 @@ rek_bt* rek_bt_open(const char* magnet_uri, const char* cache_dir, uint16_t port
 /// Mount the release a .torrent file describes. The metadata is in the file, so
 /// there is no BEP 9 wait and no swarm needed to browse it.
 rek_bt* rek_bt_open_torrent(const char* torrent_path, const char* cache_dir, uint16_t port,
-                            int enable_dht, char* err, size_t err_len) {
+                            int enable_dht, const rek_bt_config* cfg, char* err, size_t err_len) {
     if (!torrent_path || !cache_dir) {
         set_error(err, err_len, "a .torrent path and a cache directory are required");
         return nullptr;
@@ -404,7 +784,7 @@ rek_bt* rek_bt_open_torrent(const char* torrent_path, const char* cache_dir, uin
         return nullptr;
     }
 
-    rek_bt* bt = start_session(cache_dir, port, enable_dht, err, err_len);
+    rek_bt* bt = start_session(cache_dir, port, enable_dht, cfg, err, err_len);
     if (!bt) return nullptr;
 
     bt->hash = info->info_hash();
@@ -534,6 +914,29 @@ void rek_bt_state(rek_bt* bt, rek_bt_progress* out) {
     out->progress     = status.progress;
 }
 
+/// The cap this session runs under, in bytes (0 = unbounded). Reported so the
+/// banner can say what is being enforced instead of leaving the user to guess.
+uint64_t rek_bt_cache_limit(rek_bt* bt) { return bt ? bt->cache_limit : 0; }
+
+/// What the cache occupies on disk right now, holes and sparse regions excluded
+/// — the same number `du` would print, not the picker's idea of what it kept.
+uint64_t rek_bt_cache_bytes(rek_bt* bt) {
+    if (!bt || bt->files.empty()) return 0;
+    bt->cache_bytes = allocated_bytes(*bt);
+    return bt->cache_bytes;
+}
+
+/// Bytes an unprivileged process can still write to the filesystem holding
+/// @p path, or 0 when it cannot be asked. This is what "cache limit auto" is
+/// computed from: the limit has to follow the disk the cache is actually on, not
+/// a constant picked for a desktop.
+uint64_t rek_bt_free_bytes(const char* path) {
+    if (!path) return 0;
+    struct statvfs vfs;
+    if (::statvfs(path, &vfs) != 0) return 0;
+    return uint64_t(vfs.f_bavail) * uint64_t(vfs.f_frsize);
+}
+
 /*
  * Read @p len bytes at @p offset of the torrent's byte space, blocking until the
  * pieces that cover them are on disk. Returns the count read, or -errno:
@@ -628,6 +1031,13 @@ int64_t rek_bt_read(rek_bt* bt, uint64_t offset, void* buffer, size_t len, int t
         std::memcpy(out + written, bytes.data(), bytes.size());
         written += bytes.size();
     }
+
+    // The read is done, so the pieces it touched are worth keeping (a re-read of
+    // the same block is common) and everything cold can go: this is where a
+    // cache limit is actually enforced, once per read instead of on a timer that
+    // would keep running on an idle mount.
+    note_recent(*bt, first, last);
+    evict_to_limit(*bt);
     return static_cast<int64_t>(written);
 }
 

@@ -194,3 +194,30 @@ does not pull 100 GB. Seeking is the same mechanism: the pieces of every read
 still in flight stay prioritised, so a seek does not starve the read it
 interrupted. Pieces land in `--cache` (`[.rekarma]`), keyed by the torrent's own
 paths, so a second run resumes what is already there.
+
+### The cache is bounded
+
+A mount read at random offsets used to grow its cache for ever: a 2 TB archive
+would eventually want 2 TB of disk. It no longer does. `--cache-limit <size>`
+(`5G`, `512M`, `0` = no limit) caps what one release keeps, and by default the
+cache is held to 60 % of the free space on the filesystem it lives on — so the
+same binary behaves sanely on a 10 GB VPS and on a 2 TB desktop without a flag
+for either.
+
+Past the limit the coldest pieces are dropped: the piece is forgotten by the
+engine and its blocks are punched out of the cache file
+(`FALLOC_FL_PUNCH_HOLE|KEEP_SIZE`), which frees the space while leaving the
+file's size — and therefore the tree the mount exposes — unchanged. Reading
+that piece again downloads it again; the recently-read ones are kept, so a
+player re-reading its own seconds does not pay for it. The same pass reclaims
+the blocks of pieces that were abandoned half-downloaded, which is the residue
+that used to sit on disk for ever after a seek.
+
+`--prefetch <size>` (default 128 MiB) is the read-ahead per waiting read, held
+to a sixteenth of the cache limit when the limit is small; `--fuse-threads <n>`
+is how many FUSE workers serve the mount (default 32). On one core, 32 workers
+are 32 threads waiting for pieces: 8 is plenty.
+
+`REKARMA_EVICT_DEBUG=1` makes the eviction pass print what it sees (pieces
+dropped, bytes left), which is the quickest way to answer "why is my cache this
+big".

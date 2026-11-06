@@ -3,6 +3,7 @@ const Io = std.Io;
 const c = @import("c");
 const room_log = @import("room_log.zig");
 const magnet = @import("magnet.zig");
+const size = @import("size.zig");
 
 /// One room and one file for everyone who just runs the program; --room and
 /// --file are how a second room — or a second log of the same one — is chosen.
@@ -120,6 +121,9 @@ fn run(init: std.process.Init) !void {
             .port = opts.port,
             .dht = opts.discovery and opts.dht,
             .peers = peers,
+            .cache_limit = opts.cache_limit,
+            .prefetch = opts.prefetch,
+            .fuse_threads = opts.fuse_threads,
         });
         return;
     }
@@ -626,6 +630,45 @@ fn parseArgs(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
                 opts.problem = try std.fmt.allocPrint(gpa, "{s} needs a directory", .{name});
                 break :parse;
             };
+        } else if (std.mem.eql(u8, name, "--cache-limit")) {
+            const value = reader.value(attached) orelse {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} needs a size (5G, 512M, 0 = no limit)", .{name});
+                break :parse;
+            };
+            opts.cache_limit = size.parse(value) orelse {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} is not a size: bytes with K/M/G/T, or 0", .{value});
+                break :parse;
+            };
+        } else if (std.mem.eql(u8, name, "--prefetch")) {
+            const value = reader.value(attached) orelse {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} needs a size (128M, 16M, …)", .{name});
+                break :parse;
+            };
+            opts.prefetch = size.parse(value) orelse {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} is not a size: bytes with K/M/G/T", .{value});
+                break :parse;
+            };
+            // A window smaller than a piece would ask for less than one block of
+            // read-ahead and stall a sequential reader on every piece boundary.
+            if (opts.prefetch.? < 1024 * 1024) {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} is too small: below 1M a read waits for every piece", .{value});
+                break :parse;
+            }
+        } else if (std.mem.eql(u8, name, "--fuse-threads")) {
+            const value = reader.value(attached) orelse {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} needs a thread count", .{name});
+                break :parse;
+            };
+            opts.fuse_threads = std.fmt.parseInt(u32, value, 10) catch {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} is not a thread count", .{value});
+                break :parse;
+            };
+            // Zero would mean "the default" and then be indistinguishable from a
+            // typo; the ceiling is what the glue accepts.
+            if (opts.fuse_threads == 0 or opts.fuse_threads > 128) {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} must be 1..128 threads", .{value});
+                break :parse;
+            }
         } else if (std.mem.eql(u8, name, "--show")) {
             opts.show = true;
         } else if (std.mem.eql(u8, name, "--daemon")) {
@@ -844,6 +887,13 @@ const Options = struct {
     mount: ?[]const u8 = null,
     /// Where the magnet's pieces are written and kept; null = .rekarma.
     cache: ?[]const u8 = null,
+    /// Bytes the cache may keep on disk; null = 60% of what is free on the
+    /// cache's filesystem, 0 = everything that was read (the old behaviour).
+    cache_limit: ?u64 = null,
+    /// Read-ahead per waiting read, in bytes; null = the engine's 128 MiB.
+    prefetch: ?u64 = null,
+    /// FUSE worker threads; 0 = the default of 32.
+    fuse_threads: u32 = 0,
     /// Set instead of the options when the command line does not parse.
     problem: ?[]const u8 = null,
 };
@@ -896,6 +946,14 @@ fn printUsage(out: *Io.Writer) !void {
         \\      --cache <dir>      where pieces are written and kept [.rekarma]
         \\                         browsing costs the metadata only; a file is
         \\                         fetched when it is read, piece by piece
+        \\      --cache-limit <n>  keep the cache under this size: 5G, 512M, …
+        \\                         0 = everything read stays     [60% of free]
+        \\                         pieces nobody read recently are dropped and
+        \\                         fetched again when they are read again
+        \\      --prefetch <n>      read-ahead per waiting read       [128M]
+        \\                         smaller is kinder to a slow link and to RAM
+        \\      --fuse-threads <n>  FUSE worker threads                 [32]
+        \\                         one reader needs one; a 1-core box needs < 32
         \\  -v, --verbose          show librats' own INFO logs on stdout
         \\      --version          print rekarma's and librats' versions and exit
         \\  -h, --help             this help

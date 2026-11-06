@@ -144,11 +144,21 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // Size parsing: a "5X" that came back as 0 would silently turn the cache
+    // limit off, so the refusal is worth a test of its own.
+    const size_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/size.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(log_tests).step);
     test_step.dependOn(&b.addRunArtifact(tree_tests).step);
     test_step.dependOn(&b.addRunArtifact(tracker_tests).step);
+    test_step.dependOn(&b.addRunArtifact(size_tests).step);
 
     const run_step = b.step("run", "Run the app");
 
