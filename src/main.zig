@@ -123,6 +123,7 @@ fn run(init: std.process.Init) !void {
             .peers = peers,
             .cache_limit = opts.cache_limit,
             .prefetch = opts.prefetch,
+            .pipeline = opts.pipeline,
             .fuse_threads = opts.fuse_threads,
         });
         return;
@@ -654,6 +655,22 @@ fn parseArgs(gpa: std.mem.Allocator, args: []const [:0]const u8) !Options {
                 opts.problem = try std.fmt.allocPrint(gpa, "{s} is too small: below 1M a read waits for every piece", .{value});
                 break :parse;
             }
+        } else if (std.mem.eql(u8, name, "--pipeline")) {
+            const value = reader.value(attached) orelse {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} needs a block count (500, 0 = the engine's own)", .{name});
+                break :parse;
+            };
+            opts.pipeline = std.fmt.parseInt(u32, value, 10) catch {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} is not a block count", .{value});
+                break :parse;
+            };
+            // One block is 16 KiB, so a queue is a per-peer memory bill paid out of
+            // the engine's write queue; a value above a few thousand asks for more
+            // than any swarm can use and only delays the stall detection.
+            if (opts.pipeline.? > 4096) {
+                opts.problem = try std.fmt.allocPrint(gpa, "{s} is too deep: at most 4096 blocks per peer", .{value});
+                break :parse;
+            }
         } else if (std.mem.eql(u8, name, "--fuse-threads")) {
             const value = reader.value(attached) orelse {
                 opts.problem = try std.fmt.allocPrint(gpa, "{s} needs a thread count", .{name});
@@ -892,6 +909,8 @@ const Options = struct {
     cache_limit: ?u64 = null,
     /// Read-ahead per waiting read, in bytes; null = the engine's 128 MiB.
     prefetch: ?u64 = null,
+    /// Block requests kept in flight per peer; null = 500, 0 = librats' own 16.
+    pipeline: ?u32 = null,
     /// FUSE worker threads; 0 = the default of 32.
     fuse_threads: u32 = 0,
     /// Set instead of the options when the command line does not parse.
@@ -952,6 +971,9 @@ fn printUsage(out: *Io.Writer) !void {
         \\                         fetched again when they are read again
         \\      --prefetch <n>      read-ahead per waiting read       [128M]
         \\                         smaller is kinder to a slow link and to RAM
+        \\      --pipeline <n>      block requests in flight per peer [500]
+        \\                         16K each: deeper is faster on a fast link
+        \\                         with few seeders, 0 = librats' own 16
         \\      --fuse-threads <n>  FUSE worker threads                 [32]
         \\                         one reader needs one; a 1-core box needs < 32
         \\  -v, --verbose          show librats' own INFO logs on stdout

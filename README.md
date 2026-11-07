@@ -218,6 +218,15 @@ to a sixteenth of the cache limit when the limit is small; `--fuse-threads <n>`
 is how many FUSE workers serve the mount (default 32). On one core, 32 workers
 are 32 threads waiting for pieces: 8 is plenty.
 
+`--pipeline <blocks>` (default 500, 0 = the engine's own 16) is how many block
+requests each peer is kept busy with. It is what makes a fast line playable: 16
+blocks is 256 KiB, so a peer 150 ms away cannot give more than ~1.7 MB/s however
+fast it is, and a 4K remux needs 70 Mbit/s continuously. The depth follows each
+peer's measured rate (a slow seeder holds ~a second of its own work, not a
+corner of the piece you are watching), and a piece the reader has waited 700 ms
+for is requested a second time from a faster peer — rare duplicate traffic, spent
+only on the piece that is blocking playback.
+
 `REKARMA_EVICT_DEBUG=1` makes the eviction pass print what it sees (pieces
 dropped, bytes left), which is the quickest way to answer "why is my cache this
 big".

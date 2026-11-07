@@ -173,6 +173,29 @@ give a sender `--wait` if the DHT needs longer than its default 90 s.
   same 3.0.4 headers the library was built from with `private` spelled `public`
   to reach `Torrent::picker_/disk_/peers_`, and touches them only on the reactor
   (via `Reactor::post`). Keep it that way — those members are lock-free.
+- **A 16-block request queue per peer is the default and it starves streaming.**
+  `Torrent::kPipelineDepth` in the vendored librats is 16 blocks (256 KiB) and
+  refill happens only when one arrives, so one peer is capped at
+  `256 KiB / RTT` — 1.7 MB/s to a peer 150 ms away, whatever the peer can
+  upload. Filling a 100 Mbit/s line then needs six fast seeders at once, and a
+  4K remux that plays at 70 Mbit/s stutters. The constant is inside the
+  archive, so `deep_refill()` (a 20 ms timer on the reactor) tops the queues up
+  from the outside to `--pipeline` blocks. Depth is not handed out evenly: it
+  follows each peer's measured rate (~1 s of what it delivers, taken from the
+  engine's `recent_down_` counter, which resets every 10 s — treat a decrease
+  as the reset, not a negative rate), because the *slowest* owner of a piece
+  decides when the reader resumes and one peer at a few KB/s holding 100 blocks
+  of it is a 10 s stall. For the same reason peers below a quarter of the best
+  peer's rate are not given blocks of the piece a reader is blocked on, and a
+  piece that sits 700 ms past its deadline gets its outstanding blocks requested
+  a second time from a faster peer (end-game: the engine cancels the loser).
+  Measured on a 2002 2160p remux, 4–34 peers: 7–20 MB/s with 3–12 s stalls
+  before, 14–15 MB/s with ~1 s p99 after. `--pipeline 0` restores the old
+  16-block behaviour for an A/B.
+- The reader's own diagnostic is in the stall line: it names the pieces, the
+  block states and the peers holding blocks with their paces. That is what
+  separates "slow swarm" from "our scheduling" — the two look identical from
+  the outside.
 - Any change to the priority window must keep `update_interest()` being called
   for every peer afterwards: priorities are not interest, and without the
   INTERESTED message a choked peer never serves the piece being waited on.

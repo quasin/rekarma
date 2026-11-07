@@ -66,16 +66,26 @@ pub const Params = struct {
     cache_limit: ?u64 = null,
     /// Read-ahead per waiting read, in bytes; null = the engine's 128 MiB.
     prefetch: ?u64 = null,
+    /// Block requests kept in flight per peer; null = 500 (8 MiB per peer at
+    /// 16 KiB blocks, what qBittorrent asks for). 0 = librats' own 16, which is
+    /// 256 KiB per peer — enough to cap one peer at a couple of MB/s.
+    pipeline: ?u32 = null,
     /// FUSE worker threads; 0 = the glue's default (32). A read blocks until its
     /// pieces arrive, so readers want more than one, but a 1-core box does not
     /// want 32 threads competing for it.
     fuse_threads: u32 = 0,
 };
 
+/// Block requests in flight per peer when nobody asks for something else. 16 KiB
+/// blocks, so this is 8 MiB per peer — qBittorrent's reqq, and the depth a
+/// 100 Mbit/s link needs from one peer 100 ms away.
+pub const default_pipeline_blocks: u32 = 500;
+
 /// The engine's per-mount budget (src/magnet_shim.cpp rek_bt_config).
 const BtConfig = extern struct {
     cache_limit: u64,
     prefetch: u64,
+    pipeline: u32,
 };
 
 /// The shim's C ABI (src/magnet_shim.cpp). The file list is borrowed from the
@@ -127,6 +137,7 @@ pub fn run(io: Io, gpa: std.mem.Allocator, out: *Io.Writer, params: Params) !voi
         // 0 = the engine's own 128 MiB: the window is a property of a reader, not
         // of the disk, so it is only overridden when asked for.
         .prefetch = params.prefetch orelse 0,
+        .pipeline = params.pipeline orelse default_pipeline_blocks,
     };
     const opened = if (params.torrent)
         rek_bt_open_torrent(source_z.ptr, cache_z.ptr, params.port, @intFromBool(params.dht), &config, &err_buf, err_buf.len)

@@ -110,6 +110,9 @@ struct rek_bt_progress {
 struct rek_bt_config {
     uint64_t cache_limit;
     uint64_t prefetch;
+    /// Block requests to keep in flight per peer (0 = librats' own 16). See
+    /// kRefillChunk for why 16 is not enough for streaming.
+    uint32_t pipeline;
 };
 
 struct rek_bt {
@@ -135,6 +138,32 @@ struct rek_bt {
     uint64_t cache_target = 0;
     /// Read-ahead per active window, in bytes (0 = kPrefetchBytes).
     uint64_t prefetch_bytes = 0;
+    /// Block requests kept in flight per peer (0 = librats' own 16). See
+    /// deep_refill() for why 16 is not enough to stream a film.
+    uint32_t pipeline_blocks = 0;
+    /// Stops the refill timer when the session goes away: it can fire while
+    /// client->stop() is joining the reactor thread.
+    std::shared_ptr<std::atomic<bool>> refill_alive;
+    bool refill_timer_armed = false;
+
+    /// Per-peer delivery pace, so a deep queue is handed to peers that actually
+    /// deliver instead of being split evenly over the swarm (see deep_refill).
+    /// Keyed by the raw connection pointer; only touched on the reactor thread.
+    struct PeerPace {
+        double   rate  = 0.0;  ///< bytes per second, smoothed
+        uint64_t bytes = 0;    ///< the engine's per-peer byte counter, last sample
+    };
+    std::unordered_map<const void*, PeerPace> pace;
+    std::chrono::steady_clock::time_point     pace_at{};
+
+    /// Pieces a reader is waiting for that are taking too long: when they were
+    /// first noticed, so their outstanding blocks can be requested a second time
+    /// from a peer that is delivering (see duplicate_late_piece).
+    std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> late;
+    /// Blocks whose second copy was requested for a late piece (see
+    /// duplicate_piece). Reported on the "still waiting" line so a stall can be
+    /// told apart from a swarm that simply has nothing.
+    std::uint64_t duplicate_blocks = 0;
     /// Where the next eviction pass starts looking. A rotating cursor instead of
     /// a scan from piece 0 keeps eviction as cheap on a 500 000-piece torrent as
     /// on a 50-piece one.
@@ -625,6 +654,227 @@ uint32_t pump_range(rek_bt& bt, uint32_t first, uint32_t last) {
     return missing;
 }
 
+/// A piece a reader is waiting for has missed its deadline: ask one more peer for
+/// each of its blocks that only one peer is currently on. This is BitTorrent's
+/// end-game trade — some bytes are fetched twice — spent on the few pieces that
+/// stand between the reader and the next second of video, and only while they are
+/// late.
+///
+/// The engine already handles the duplicates: the winner's block arrives, it
+/// cancels the other request and takes the slot back, so nothing is left
+/// double-counted. `by_rate` is ordered fastest first, so the copy goes to a peer
+/// that has been delivering.
+void duplicate_piece(rek_bt& bt, uint32_t piece, const std::vector<PeerConnection*>& by_rate) {
+    auto it = bt.picker->downloading_.find(piece);
+    if (it == bt.picker->downloading_.end()) return;
+    PiecePicker::DownloadingPiece& dp = it->second;
+    Torrent& torrent = *bt.torrent;
+
+    for (uint32_t b = 0; b < dp.blocks.size(); ++b) {
+        PiecePicker::Block& block = dp.blocks[b];
+        if (block.state != BlockState::Requested || block.peers.size() != 1) continue;
+        const void* owner = block.peers.front();
+        for (PeerConnection* pc : by_rate) {
+            if (static_cast<const void*>(pc) == owner) continue;
+            if (!pc->peer_bitfield().get(piece)) continue;
+            int& outstanding = torrent.outstanding_[pc];
+            if (outstanding >= int(bt.pipeline_blocks)) continue;
+            const PieceBlock pb{piece, b};
+            bt.picker->mark_requested(pb, pc);
+            pc->send_request(piece, b * kBlockSize, bt.picker->block_size(piece, b));
+            ++outstanding;
+            ++bt.duplicate_blocks;
+            break;
+        }
+    }
+}
+
+/// Block requests kept in flight per peer, how often the queues are topped up, and
+/// how long a piece a reader is waiting for may sit before its blocks are asked
+/// for a second time.
+///
+/// librats asks for kPipelineDepth = 16 blocks (256 KiB) per peer and only refills
+/// when one arrives, so a single peer is capped at 256 KiB / RTT: 1.7 MB/s to a
+/// peer 150 ms away, whatever that peer's own bandwidth is. Filling a 100 Mbit/s
+/// line would take six fast seeders, which a film release rarely offers, and the
+/// read stalls while it waits.
+///
+/// A deeper queue has to be driven from here because the constant lives in the
+/// vendored archive. It is also not enough on its own: a queue of N blocks handed
+/// to a slow peer makes *that peer* the piece's completion time, and the reader
+/// waits for the whole piece. So the depth follows each peer's measured rate, and
+/// a piece the reader is waiting on that misses its deadline asks for its
+/// outstanding blocks a second time from somebody faster.
+constexpr int kRefillChunk = 32;
+/// The floor: a peer that has shown nothing gets a few blocks as a probe, not the
+/// 16 it used to get even while delivering nothing — 25 such peers each holding 16
+/// blocks of the reader's piece is a piece that never completes.
+constexpr int kMinPeerBlocks = 4;
+constexpr std::chrono::milliseconds kLatePiece{700};
+constexpr std::chrono::milliseconds kRefillInterval{20};
+
+/// How deep this peer's queue should be: one second of what it has proven it can
+/// deliver, so a slow seeder holds a small slice of a piece instead of all of it,
+/// and never more than the session's --pipeline.
+int peer_depth(const rek_bt& bt, const rek_bt::PeerPace& pace) {
+    const int depth = int(pace.rate / double(kBlockSize));
+    return std::clamp(depth, kMinPeerBlocks, int(bt.pipeline_blocks));
+}
+
+/// Ask every unchoked peer for more blocks, deeper for the ones that are
+/// delivering. Reactor thread only — it walks peers_ and mutates the picker, like
+/// librats' refill().
+///
+/// Deliberately silent when nobody is reading: an idle mount must not pull the
+/// release in the background (librats' own refill covers the keepalive piece).
+void deep_refill(rek_bt& bt) {
+    if (bt.pipeline_blocks == 0 || !bt.torrent || !bt.picker || !bt.disk) return;
+    Torrent& torrent = *bt.torrent;
+    if (!torrent.running_) return;
+
+    std::vector<rek_bt::Range> reading;
+    {
+        std::lock_guard<std::mutex> lock(bt.active_mutex);
+        reading = bt.active;
+    }
+    if (reading.empty()) {
+        // Nobody is reading: keep the measured paces (a pause or a seek should not
+        // make every peer look new) but drop the deadlines and the sample clock, so
+        // the first pass after the pause does not divide a minute by nothing.
+        bt.late.clear();
+        bt.pace_at = std::chrono::steady_clock::time_point{};
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const double dt = bt.pace_at == std::chrono::steady_clock::time_point{}
+        ? 0.0 : std::chrono::duration<double>(now - bt.pace_at).count();
+    bt.pace_at = now;
+
+    // Drop what belongs to connections the torrent has let go: the pointers are
+    // only valid while they are in peers_, and a recycled address must not
+    // inherit somebody else's rate.
+    for (auto it = bt.pace.begin(); it != bt.pace.end();) {
+        if (std::find(torrent.peers_.begin(), torrent.peers_.end(), it->first) == torrent.peers_.end())
+            it = bt.pace.erase(it);
+        else
+            ++it;
+    }
+
+    // Measure each peer, then ask the fast ones first: a block freed by a snub or
+    // by duplicate_piece below must land on a peer that will deliver it.
+    std::vector<std::pair<double, PeerConnection*>> by_rate;
+    for (PeerConnection* pc : torrent.peers_) {
+        if (!pc || pc->closed()) continue;
+        rek_bt::PeerPace& pace = bt.pace[pc];
+        // The engine keeps a per-peer byte count for its choker (recent_down_), 
+        // reset every ~10 s with the choke round. A counter that went backwards is
+        // that reset, not a negative rate: rebaseline and keep the last estimate.
+        const uint64_t bytes = torrent.recent_down_[pc];
+        if (dt > 0.0 && bytes >= pace.bytes) {
+            const double measured = double(bytes - pace.bytes) / dt;
+            // A peer that speeds up is believed at once; one that slows down is
+            // given the benefit of the doubt for a few passes.
+            pace.rate = measured > pace.rate ? measured : pace.rate * 0.75 + measured * 0.25;
+        }
+        pace.bytes = bytes;
+        if (pc->peer_choking() || !pc->am_interested()) continue;
+        by_rate.emplace_back(pace.rate, pc);
+    }
+    std::sort(by_rate.begin(), by_rate.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::vector<PeerConnection*> order;
+    order.reserve(by_rate.size());
+    for (const auto& entry : by_rate) order.push_back(entry.second);
+
+    // Peers this slow do not get blocks the reader is waiting on: a piece completes
+    // when its *last* block arrives, so one peer at a few KB/s owning a corner of it
+    // is the whole stall. They still fetch the pieces further ahead, which have no
+    // deadline yet. The cut is relative to the best peer, so a swarm where everyone
+    // is slow is not starved.
+    const double fast_cutoff = by_rate.empty() ? 0.0 : by_rate.front().first * 0.25;
+    auto in_readers_way = [&reading](std::uint32_t piece) {
+        for (const auto& range : reading) {
+            if (piece >= range.first && piece <= range.last) return true;
+        }
+        return false;
+    };
+
+    // Same backpressure the engine applies: a fast swarm must not grow the write
+    // queue without bound. Requesting resumes on the next pass as it drains.
+    if (bt.disk->queued_write_bytes() <= Torrent::kDiskWriteHighWater) {
+        for (PeerConnection* pc : order) {
+            rek_bt::PeerPace& pace = bt.pace[pc];
+            int& outstanding = torrent.outstanding_[pc];
+            const int depth = peer_depth(bt, pace);
+            int budget = depth - outstanding;
+            if (budget <= 0) continue;
+            if (budget > kRefillChunk) budget = kRefillChunk;
+            const bool slow = pace.rate < fast_cutoff;
+
+            const bool idle = outstanding == 0;
+            const std::vector<PieceBlock> blocks =
+                bt.picker->pick_blocks(pc->peer_bitfield(), budget, pc);
+            for (const PieceBlock& b : blocks) {
+                if (slow && in_readers_way(b.piece)) continue;
+                bt.picker->mark_requested(b, pc);
+                pc->send_request(b.piece, b.block * kBlockSize, bt.picker->block_size(b.piece, b.block));
+                ++outstanding;
+            }
+            // The engine's stall clock: a peer that holds requests and delivers
+            // nothing is snubbed after kRequestTimeout, which frees its blocks for
+            // somebody who is actually sending.
+            if (idle && outstanding > 0) torrent.request_time_[pc] = now;
+        }
+    }
+
+    // The pieces a reader is actually blocked on, and only those: a piece that
+    // takes longer than kLatePiece gets its outstanding blocks asked for from one
+    // more peer. Whichever copy arrives first wins and the engine cancels the
+    // other, so a single slow seeder can no longer decide when playback resumes.
+    for (const rek_bt::Range& range : reading) {
+        const uint32_t last = std::min(range.last, bt.num_pieces - 1);
+        for (uint32_t piece = range.first; piece <= last; ++piece) {
+            if (bt.picker->have_piece(piece)) {
+                bt.late.erase(piece);
+                continue;
+            }
+            const auto it = bt.late.find(piece);
+            if (it == bt.late.end()) {
+                bt.late.emplace(piece, now);
+                continue;
+            }
+            if (now - it->second < kLatePiece) continue;
+            it->second = now;
+            duplicate_piece(bt, piece, order);
+        }
+    }
+    // Forget the pieces no read is waiting for any more.
+    for (auto it = bt.late.begin(); it != bt.late.end();) {
+        const uint32_t piece = it->first;
+        const bool still_read = std::any_of(reading.begin(), reading.end(), [piece](const rek_bt::Range& r) {
+            return piece >= r.first && piece <= r.last;
+        });
+        it = still_read ? std::next(it) : bt.late.erase(it);
+    }
+}
+
+
+void schedule_refill(rek_bt& bt);
+
+/// Arm the refill timer on the reactor. One-shot timers that re-arm themselves
+/// (the reactor has no repeating timer), stopped by `refill_alive`.
+void schedule_refill(rek_bt& bt) {
+    if (!bt.refill_alive->load() || !bt.client) return;
+    std::shared_ptr<std::atomic<bool>> alive = bt.refill_alive;
+    rek_bt* self = &bt;
+    bt.client->reactor().schedule(kRefillInterval, [self, alive] {
+        if (!alive->load()) return;
+        deep_refill(*self);
+        schedule_refill(*self);
+    });
+}
+
 void collect_metadata(rek_bt& bt, const TorrentInfo& info) {
     bt.name         = info.name();
     bt.piece_length = info.piece_length();
@@ -697,6 +947,8 @@ rek_bt* start_session(const char* cache_dir, uint16_t port, int enable_dht, cons
     bt->cache_root     = cache_dir;
     bt->cache_limit    = cfg ? cfg->cache_limit : 0;
     bt->prefetch_bytes = cfg ? cfg->prefetch : 0;
+    bt->pipeline_blocks = cfg ? cfg->pipeline : 0;
+    bt->refill_alive   = std::make_shared<std::atomic<bool>>(true);
     if (bt->cache_limit != 0) {
         constexpr uint64_t kMinLimit = 32ull * 1024 * 1024;
         if (bt->cache_limit < kMinLimit) bt->cache_limit = kMinLimit;
@@ -726,6 +978,68 @@ rek_bt* start_session(const char* cache_dir, uint16_t port, int enable_dht, cons
 
     bt->client->start();
     return bt.release();
+}
+
+/// One line for the "still waiting" message: what the blocks of the reader's
+/// pieces are doing and how many peers could actually deliver them, so a stall on
+/// a slow seeder can be told apart from a swarm that has nothing left to give.
+/// Runs one reactor pass per call, i.e. only when a read is already stuck.
+void describe_stall(rek_bt& bt, uint32_t first, uint32_t last, char* out, size_t len) {
+    if (!bt.client || !bt.picker || !bt.torrent) {
+        std::snprintf(out, len, "no picker yet");
+        return;
+    }
+    unsigned none = 0, requested = 0, writing = 0, unchoked = 0;
+    std::vector<std::string> owners;   // "ip:port" of a peer holding blocks of the range
+    std::vector<unsigned>    held;     // how many blocks that peer holds
+    std::vector<double>      pace_rates;  // its measured pace, blocks per second
+
+    on_reactor(*bt.client, [&] {
+        for (PeerConnection* pc : bt.torrent->peers_) {
+            if (pc && pc->am_interested() && !pc->peer_choking()) ++unchoked;
+        }
+        for (uint32_t piece = first; piece <= std::min(last, bt.num_pieces - 1); ++piece) {
+            if (bt.picker->have_piece(piece)) continue;
+            const auto it = bt.picker->downloading_.find(piece);
+            if (it == bt.picker->downloading_.end()) {
+                ++none;
+                continue;
+            }
+            for (const PiecePicker::Block& block : it->second.blocks) {
+                if (block.state == BlockState::None) { ++none; continue; }
+                if (block.state == BlockState::Writing) { ++writing; continue; }
+                if (block.state != BlockState::Requested) continue;
+                ++requested;
+                for (const void* owner : block.peers) {
+                    auto* pc = static_cast<PeerConnection*>(const_cast<void*>(owner));
+                    char label[64];
+                    std::snprintf(label, sizeof label, "%s:%u", pc->remote_ip().c_str(), pc->remote_port());
+                    auto found = std::find(owners.begin(), owners.end(), std::string(label));
+                    if (found != owners.end()) {
+                        ++held[size_t(found - owners.begin())];
+                        continue;
+                    }
+                    owners.emplace_back(label);
+                    held.push_back(1);
+                    const auto pace = bt.pace.find(owner);
+                    pace_rates.push_back(pace == bt.pace.end() ? 0.0 : pace->second.rate);
+                }
+            }
+        }
+    });
+
+    std::snprintf(out, len, "blocks none %u requested %u writing %u; %u unchoked; dups %llu;",
+                  none, requested, writing, unchoked, (unsigned long long)bt.duplicate_blocks);
+    // Which peers are sitting on the reader's blocks, and at what pace.
+    std::vector<size_t> by_share(owners.size());
+    for (size_t i = 0; i < by_share.size(); ++i) by_share[i] = i;
+    std::sort(by_share.begin(), by_share.end(), [&](size_t a, size_t b) { return held[a] > held[b]; });
+    for (size_t i = 0; i < std::min<size_t>(by_share.size(), 3); ++i) {
+        const size_t at = by_share[i];
+        char part[112];
+        std::snprintf(part, sizeof part, " %u@%s(%.0f b/s)", held[at], owners[at].c_str(), pace_rates[at]);
+        strncat(out, part, len - strlen(out) - 1);
+    }
 }
 
 } // namespace
@@ -840,6 +1154,11 @@ uint16_t rek_bt_listen_port(rek_bt* bt) {
 
 void rek_bt_close(rek_bt* bt) {
     if (!bt) return;
+    // Stop the refill timer before the reactor thread is joined: the callback
+    // captures the session, so it must not run after stop() returns and
+    // `delete bt` frees it. The flag is checked first in the callback; stop()
+    // then joins the thread, so no callback is in flight afterwards.
+    if (bt->refill_alive) bt->refill_alive->store(false);
     if (bt->client) bt->client->stop();
     if (bt->dht) bt->dht->stop();
     delete bt;
@@ -883,6 +1202,12 @@ int rek_bt_wait_metadata(rek_bt* bt, int timeout_ms) {
                     bt->picker->set_piece_priority(keepalive, PiecePriority::Normal);
                 bt->keepalive = keepalive;
                 bt->hot.clear();
+                // The deeper per-peer queue starts here, not earlier: there is no
+                // picker to feed before the metadata lands.
+                if (bt->pipeline_blocks != 0 && !bt->refill_timer_armed) {
+                    bt->refill_timer_armed = true;
+                    schedule_refill(*bt);
+                }
             });
             if (!bt->picker || !bt->disk) return -EIO;
             return 0;
@@ -1009,9 +1334,12 @@ int64_t rek_bt_read(rek_bt* bt, uint64_t offset, void* buffer, size_t len, int t
         // for, and from how many peers, while the swarm works.
         if (now - said >= std::chrono::seconds(3)) {
             said = now;
-            std::fprintf(stderr, "rekarma: waiting for pieces %u..%u (%u missing, %zu peers, %lld ms)\n",
-                         first, last, missing, bt->torrent->num_peers(),
-                         (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - started).count());
+            char detail[192];
+            describe_stall(*bt, first, last, detail, sizeof detail);
+            std::fprintf(stderr, "rekarma: waiting for pieces %u..%u (%u missing, %lld ms): %s\n",
+                         first, last, missing,
+                         (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - started).count(),
+                         detail);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
