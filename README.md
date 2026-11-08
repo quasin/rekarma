@@ -18,8 +18,8 @@ Nothing from either C dependency lives in the repository. `install.sh` builds
 both from the pinned source tarballs and installs the results under `vendor/`,
 which `.gitignore` excludes — one directory per target triple:
 
-    vendor/librats/<triple>/include/, librats.a   the engine   (3.0.4, sha256
-                                                                36e21f34cebef6fb0845f6498f1d91f9c62b944f9a594fe1899b702337f89a1a)
+    vendor/librats/<triple>/include/, librats.a   the engine   (3.0.5, sha256
+                                                                16fc743d27dc04cd9df7d47961942b984989aceccb735cb550f1dd57ce6fee68)
     vendor/fuse3/<triple>/include/, libfuse3.a    the mount    (3.18.3, sha256
                                                                 bcd19582c5e30f7fe45dd86a5540e998590aa01903afc7ebcbeea6c8ac5421ee)
 
@@ -64,7 +64,7 @@ Three things to know about the result:
    `rats_version()`/`rats_version_string()`. A tarball has no `.git`, so librats
    would otherwise report the hardcoded `1.0.0.0`; the fetch script passes
    `-DRATS_VERSION_OVERRIDE=<pin>` and reads the generated `version.h` back, so
-   the binary reports the tag it was really built from (`3.0.4.0`).
+   the binary reports the tag it was really built from (`3.0.5.0`).
 3. both archives are compiled against Zig's bundled libc++, so the executable
    links `link_libcpp` and needs no system libstdc++ — the `-Dlibstdcpp=` and
    `-Dlibgcc_s=` options are gone.

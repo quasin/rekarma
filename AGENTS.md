@@ -170,7 +170,7 @@ give a sender `--wait` if the DHT needs longer than its default 90 s.
   included) would otherwise wait for pieces it did not ask for.
 - The engine is reached through `src/magnet_shim.cpp`, not the C bindings: those
   expose only "add magnet, download everything". The shim compiles against the
-  same 3.0.4 headers the library was built from with `private` spelled `public`
+  same 3.0.5 headers the library was built from with `private` spelled `public`
   to reach `Torrent::picker_/disk_/peers_`, and touches them only on the reactor
   (via `Reactor::post`). Keep it that way — those members are lock-free.
 - **A 16-block request queue per peer is the default and it starves streaming.**

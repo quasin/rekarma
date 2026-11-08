@@ -29,9 +29,9 @@
 # here instead of printing a false version.
 set -euo pipefail
 
-LIBRATS_VERSION="3.0.4"
+LIBRATS_VERSION="3.0.5"
 URL="https://github.com/librats/librats/archive/refs/tags/${LIBRATS_VERSION}.tar.gz"
-SHA256="36e21f34cebef6fb0845f6498f1d91f9c62b944f9a594fe1899b702337f89a1a"
+SHA256="16fc743d27dc04cd9df7d47961942b984989aceccb735cb550f1dd57ce6fee68"
 
 # The triples build.zig looks for; keep in sync with README/AGENTS.md.
 DEFAULT_TARGETS=(x86_64-linux-gnu aarch64-linux-gnu riscv64-linux-gnu)
